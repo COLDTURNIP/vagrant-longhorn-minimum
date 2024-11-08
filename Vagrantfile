@@ -24,10 +24,14 @@ box_image = "generic/ubuntu2204"
 longhorn_version = 'v1.7.2'
 
 master_ip = "192.168.56.20"
+master_cpu = "2"
+master_memory = "2048"
 
 workers = { "k3s-worker1" => "192.168.56.21",
             "k3s-worker2" => "192.168.56.22",
            }
+worker_cpu = "1"
+worker_memory = "1024"
 
 # Extra parameters in INSTALL_K3S_EXEC variable because of
 # K3s picking up the wrong interface when starting master and worker
@@ -74,8 +78,8 @@ Vagrant.configure("2") do |config|
     master.vm.hostname = "k3s-master"
     master.vm.provider provider do |vb|
       vb.name = "k3s-master"
-      vb.memory = "2048"
-      vb.cpus = "2"
+      vb.memory = master_memory
+      vb.cpus = master_cpu
     end
     master.vm.provision "shell", inline: provision_master_script
   end
@@ -87,8 +91,8 @@ Vagrant.configure("2") do |config|
       worker.vm.hostname = worker_name
       worker.vm.provider provider do |vb|
       vb.name = worker_name
-        vb.memory = "1024"
-        vb.cpus = "1"
+        vb.memory = worker_memory
+        vb.cpus = worker_cpu
       end
       worker.vm.provision "shell", inline: provision_worker_script
     end
