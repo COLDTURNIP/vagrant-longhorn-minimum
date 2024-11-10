@@ -31,7 +31,7 @@ workers = { "k3s-worker1" => "192.168.56.21",
             "k3s-worker2" => "192.168.56.22",
            }
 worker_cpu = "1"
-worker_memory = "1024"
+worker_memory = "1536"
 
 # Extra parameters in INSTALL_K3S_EXEC variable because of
 # K3s picking up the wrong interface when starting master and worker
