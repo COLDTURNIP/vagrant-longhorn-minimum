@@ -12,6 +12,14 @@ The kubeconfig file would be generated as shared/k3s.yaml. Access the cluster us
 
 It will take more than 1x minutes to install reqired modules on each nodes. Please be patient.
 
+After setup, the Longhorn dashboard is available after exporting the port:
+
+```
+sudo bash longhorn_frontend_proxy.sh
+
+# the dashboard is available now at http://localhost:8080
+```
+
 ## References
 
 - https://akos.ma/blog/vagrant-k3s-and-virtualbox/
