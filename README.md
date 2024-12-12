@@ -2,13 +2,30 @@
 
 Create minimum Longhorn-ready K3s cluster using Vagrant.
 
+## Prerequisite
+
+Follow the Vagrant installation guide to setup Vagrant with VirtualBox.
+
+https://developer.hashicorp.com/vagrant/docs/installation
+
 ## Usage
 
+To create cluster:
+
 ```
-$ vagrant up --provider=virtualbox
+export DISTRO=ubuntu
+VAGRANT_VAGRANTFILE=Vagrantfile.$DISTRO vagrant up
 ```
 
-The kubeconfig file would be generated as shared/k3s.yaml. Access the cluster using `KUBECONFIG=$(pwd)/shared/k3s.yaml kubectl ...`.
+To destroy cluster:
+
+```
+VAGRANT_VAGRANTFILE=Vagrantfile.$DISTRO vagrant destroy -f
+```
+
+The `shared` folder is shared between host and VM instances. VM exchange the information under this folder, for example, the K3s token.
+
+The kubeconfig file would be generated as `shared/${DISTRO}-k3s.yaml`. Access the cluster using `KUBECONFIG=$(pwd)/shared/${DISTRO}-k3s.yaml kubectl ...`.
 
 It will take more than 1x minutes to install reqired modules on each nodes. Please be patient.
 

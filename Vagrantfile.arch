@@ -1,12 +1,28 @@
+
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 
+# ============
+# Prerequisite
+# ============
+#
+# Follow the Vagrant installation guide to setup Vagrant with VirtualBox.
+# https://developer.hashicorp.com/vagrant/docs/installation
+#
 # =====
 # Usage
 # =====
 #
+# To create cluster:
+#
 # ```
-# $ vagrant up --provider=virtualbox
+# $ VAGRANT_VAGRANTFILE=Vagrantfile.arch vagrant up
+# ```
+#
+# To destroy cluster:
+#
+# ```
+# $ VAGRANT_VAGRANTFILE=Vagrantfile.arch vagrant destroy -f
 # ```
 #
 # It will take more than 10 minutes to install reqired modules on each nodes.
@@ -19,16 +35,18 @@
 # - https://github.com/justmeandopensource/kubernetes/tree/master/vagrant-provisioning
 
 provider = "virtualbox"
-box_image = "generic/ubuntu2204"
+box_image = "archlinux/archlinux"
 
 longhorn_version = 'v1.7.2'
 
-master_ip = "192.168.56.20"
+master_host = "arch-k3s-master"
+master_ip = "192.168.56.30"
 master_cpu = "2"
 master_memory = "2048"
 
-workers = { "k3s-worker1" => "192.168.56.21",
-            "k3s-worker2" => "192.168.56.22",
+workers = { "arch-k3s-worker1" => "192.168.56.31",
+            "arch-k3s-worker2" => "192.168.56.32",
+            "arch-k3s-worker3" => "192.168.56.33",
            }
 worker_cpu = "1"
 worker_memory = "1536"
@@ -37,47 +55,62 @@ worker_memory = "1536"
 # K3s picking up the wrong interface when starting master and worker
 # https://github.com/alexellis/k3sup/issues/306
 
-provision_master_script = <<-SHELL
-    export INSTALL_K3S_EXEC="--bind-address=#{master_ip} --node-external-ip=#{master_ip} --flannel-iface eth1"
-    curl -sfL https://get.k3s.io | sh -
-    echo "Sleeping for 5 seconds to wait for k3s to start"
-    sleep 5
-    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-    cp $KUBECONFIG /vagrant_shared
-    cp /var/lib/rancher/k3s/server/token /vagrant_shared
-
-    apt install -y jq
-    snap install k9s --devmode
+provision_all_node_script = <<-SHELL
+    set -x
+    echo 'Install other CLI tools ...'
+    pacman -Sy --noconfirm git base-devel jq kubectl k9s
 
     mkdir tmp
     curl -sSfL -o tmp/longhornctl https://github.com/longhorn/cli/releases/download/#{longhorn_version}/longhornctl-linux-amd64
     chmod +x tmp/longhornctl
     mv tmp/longhornctl /usr/bin/
+
+    ( git clone https://aur.archlinux.org/yay-bin.git tmp/yay-bin && cd tmp/yay-bin && makepkg -si )
     rm -r tmp
+
+    echo 'Preparing default Kubectl configurations ...'
+    mkdir ~vagrant/.kube
+    ln -s /etc/rancher/k3s/k3s.yaml ~vagrant/.kube/config
+
+    SHELL
+
+provision_master_script = <<-SHELL
+    export INSTALL_K3S_EXEC="--bind-address=#{master_ip} --node-external-ip=#{master_ip} --flannel-iface eth1"
+    export INSTALL_K3S_BIN_DIR_READ_ONLY=true
+    yay -Sy --needed k3s-1.31-bin && curl -sfL https://get.k3s.io | sh -
+    echo "Sleeping for 5 seconds to wait for k3s to start"
+    sleep 5
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    cp $KUBECONFIG /vagrant_shared/arch-k3s.yaml
+    cp /var/lib/rancher/k3s/server/token /vagrant_shared/arch-token
 
     echo 'Install Longhorn #{longhorn_version} ...'
     kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/#{longhorn_version}/deploy/prerequisite/longhorn-iscsi-installation.yaml
     kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/#{longhorn_version}/deploy/prerequisite/longhorn-nfs-installation.yaml
+    kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/#{longhorn_version}/deploy/prerequisite/longhorn-spdk-setup.yaml
+    kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/#{longhorn_version}/deploy/prerequisite/longhorn-nvme-cli-installation.yaml
     kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/#{longhorn_version}/deploy/longhorn.yaml
     echo 'Longhorn #{longhorn_version} installed. It would take several minutes for pods get ready.'
     SHELL
 
 provision_worker_script = <<-SHELL
     export INSTALL_K3S_EXEC="--flannel-iface eth1"
-    export K3S_TOKEN_FILE=/vagrant_shared/token
+    export INSTALL_K3S_BIN_DIR_READ_ONLY=true
+    export K3S_TOKEN_FILE=/vagrant_shared/arch-token
     export K3S_URL=https://#{master_ip}:6443
     curl -sfL https://get.k3s.io | sh -
     SHELL
 
 Vagrant.configure("2") do |config|
   config.vm.box = box_image
+  config.vm.provision "shell", inline: provision_all_node_script
 
-  config.vm.define "k3s-master", primary: true do |master|
+  config.vm.define master_host, primary: true do |master|
     master.vm.network "private_network", ip: master_ip
     master.vm.synced_folder "./shared", "/vagrant_shared"
-    master.vm.hostname = "k3s-master"
+    master.vm.hostname = master_host
     master.vm.provider provider do |vb|
-      vb.name = "k3s-master"
+      vb.name = master_host
       vb.memory = master_memory
       vb.cpus = master_cpu
     end
