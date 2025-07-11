@@ -128,6 +128,13 @@ provision_all_node_script = <<-SHELL
     echo "Change to workdir ${WORKDIR}"
     pushd "${WORKDIR}"
 
+    echo 'Additional disk ...'
+    mkfs.ext4 /dev/vdb
+    mkdir -p /var/lib/longhorn
+    mount /dev/vdb /var/lib/longhorn
+    echo '/dev/vdb /var/lib/longhorn ext4 defaults 0 2' >> /etc/fstab
+    df -h
+
     echo 'System configurations'
     sysctl -w vm.nr_hugepages=1024
     echo 'vm.nr_hugepages = 1024' >>/etc/sysctl.conf
@@ -159,8 +166,8 @@ provision_master_script = <<-SHELL
     )
 
     export K3S_KUBECONFIG_MODE="644"
-    #curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="#{k3s_version}" sh -s - "${INSTALL_K3S_ARGS[@]}"
-    curl -sfL https://get.k3s.io | sh -s - "${INSTALL_K3S_ARGS[@]}"
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="#{k3s_version}" sh -s - "${INSTALL_K3S_ARGS[@]}"
+    #curl -sfL https://get.k3s.io | sh -s - "${INSTALL_K3S_ARGS[@]}"
     echo "Sleeping for 5 seconds to wait for k3s to start"
     sleep 5
     export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
@@ -199,7 +206,8 @@ provision_worker_script = <<-SHELL
     fi
 
     export K3S_TOKEN="#{k3s_token}" K3S_KUBECONFIG_MODE="644"
-    curl -sfL https://get.k3s.io | sh -s - "${INSTALL_K3S_ARGS[@]}"
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="#{k3s_version}" sh -s - "${INSTALL_K3S_ARGS[@]}"
+    #curl -sfL https://get.k3s.io | sh -s - "${INSTALL_K3S_ARGS[@]}"
 
     echo 'Preparing default Kubectl configurations ...'
     mkdir -p ~vagrant/.kube
@@ -307,6 +315,12 @@ Vagrant.configure("2") do |config|
       provider.cpus = master_cpu
       provider.cpu_mode = 'host-passthrough'
       provider.disk_driver :cache => 'unsafe'
+      provider.storage :file, {
+        size: '50G',
+        device: 'vdb',
+        path: "extend-#{master_host}.qcow2",
+        allow_existing: true,
+      }
       #provider.management_network_keep = true
     end
     master.vm.provision "master", type: "shell", inline: provision_master_script
@@ -336,6 +350,12 @@ Vagrant.configure("2") do |config|
         provider.cpus = worker_cpu
         provider.cpu_mode = 'host-passthrough'
         provider.disk_driver :cache => 'unsafe'
+        provider.storage :file, {
+          size: '50G',
+          device: 'vdb',
+          path: "extend-#{worker_name}.qcow2",
+          allow_existing: true,
+        }
         #provider.management_network_keep = true
       end
       worker.vm.provision "node_setup",
