@@ -179,6 +179,11 @@ provision_master_script = <<-SHELL
     cp /etc/rancher/k3s/k3s.yaml ~vagrant/.kube/config
     chown vagrant:vagrant ~vagrant/.kube/config
 
+    echo 'Install CSI snapshot support ...'
+    kubectl kustomize https://github.com/kubernetes-csi/external-snapshotter/client/config/crd | kubectl create -f -
+    kubectl -n kube-system kustomize deploy/kubernetes/snapshot-controller | kubectl create -f -
+    kubectl kustomize https://github.com/kubernetes-csi/external-snapshotter/deploy/kubernetes/csi-snapshotter | kubectl create -f -
+
     echo 'Install Longhorn #{longhorn_version} ...'
     kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/#{longhorn_version}/deploy/longhorn.yaml
     kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/#{longhorn_version}/deploy/prerequisite/longhorn-iscsi-installation.yaml
