@@ -90,7 +90,8 @@ k3s_version = "v1.34.2+k3s1"
 #k3s_version = "v1.13.4+k3s1"
 longhorn_version = ''
 #longhorn_version = 'master'
-#longhorn_version = 'v1.10.1'
+#longhorn_version = 'v1.11.0'
+#longhorn_version = 'v1.10.2'
 #longhorn_version = 'v1.9.2'
 #longhorn_version = 'v1.8.2'
 #longhorn_version = 'v1.7.3'
@@ -114,8 +115,8 @@ libvirt_network_firewalld_zone = "trusted"
 
 master_host = "libvirt-ubuntu-k3s-master"
 master_ip = "#{libvirt_network_subnet}.20"
-master_cpu = "4"
-master_memory = "4096"
+master_cpu = "2"
+master_memory = "3072"
 
 workers = { "libvirt-ubuntu-k3s-worker1" => "#{libvirt_network_subnet}.21",
             "libvirt-ubuntu-k3s-worker2" => "#{libvirt_network_subnet}.22",
@@ -126,13 +127,12 @@ workers = { "libvirt-ubuntu-k3s-worker1" => "#{libvirt_network_subnet}.21",
 worker_cpu = "3"
 worker_memory = "3584"
 
-kubeconfig_file = "libvirt-ubuntu-k3s.yaml"
+kubeconfig_file = "libvirt-ubuntu-k3s.config"
 k3s_token = "libvirt-ubuntu-token"
 
 # block disk is needed by Longhorn engine V2
 enable_longhorn_v2_engine = "true"
 #enable_longhorn_v2_engine = "false"
-system_log_disk_device = "/dev/vdd"
 longhorn_default_fs_disk_device = "/dev/vdc"
 longhorn_default_fs_disk_path = "/var/lib/longhorn/"
 longhorn_default_blk_disk_device = "/dev/vdb"
@@ -176,18 +176,26 @@ provision_cgroup_v1 = <<~SHELL
 # K3s picking up the wrong interface when starting master and worker
 # https://github.com/alexellis/k3sup/issues/306
 provision_all_node_script = <<~SHELL
+    ROLE="${NODE_ROLE:-worker}"
     VAGRANT_DIR=$(pwd)
     WORKDIR="$(mktemp -d)"
     trap "rm -rf -- '${WORKDIR}'" EXIT
     echo "Change to workdir ${WORKDIR}"
     pushd "${WORKDIR}"
 
+    echo "Provision node role $NODE_ROLE"
+
     echo 'System disk ...'
-    mkfs.ext4 #{system_log_disk_device}
+    if [ "$ROLE" == "master" ]; then
+      SYSTEM_LOG_DISK_DEVICE="/dev/vdb"
+    else
+      SYSTEM_LOG_DISK_DEVICE="/dev/vdd"
+    fi
+    mkfs.ext4 "$SYSTEM_LOG_DISK_DEVICE"
     mkdir -p /mnt/temp_log
-    mount #{system_log_disk_device} /mnt/temp_log
+    mount "$SYSTEM_LOG_DISK_DEVICE" /mnt/temp_log
     rsync -aHAX /var/log/ /mnt/temp_log/
-    UUID=$(blkid -s UUID -o value #{system_log_disk_device})
+    UUID=$(blkid -s UUID -o value "$SYSTEM_LOG_DISK_DEVICE")
     if ! grep -q "$UUID" /etc/fstab; then
       echo "UUID=$UUID /var/log ext4 defaults 0 2" >> /etc/fstab
     fi
@@ -195,18 +203,20 @@ provision_all_node_script = <<~SHELL
     mount -a
     systemctl restart rsyslog
 
-    echo 'Additional disk ...'
-    mkfs.ext4 #{longhorn_default_fs_disk_device}
-    mkdir -p #{longhorn_default_fs_disk_path}
-    UUID=$(blkid -s UUID -o value #{longhorn_default_fs_disk_device})
-    if ! grep -q "$UUID" /etc/fstab; then
-      echo "UUID=$UUID #{longhorn_default_fs_disk_path} ext4 defaults 0 2" >> /etc/fstab
-    fi
-    # Longhorn SPDK engine does not allow partition or filesystem on given disk
-    wipefs -a #{longhorn_default_blk_disk_device}
-    sgdisk --zap-all #{longhorn_default_blk_disk_device}
+    if [ "${ROLE}" != "master" ]; then
+      echo 'Additional disk ...'
+      mkfs.ext4 #{longhorn_default_fs_disk_device}
+      mkdir -p #{longhorn_default_fs_disk_path}
+      UUID=$(blkid -s UUID -o value #{longhorn_default_fs_disk_device})
+      if ! grep -q "$UUID" /etc/fstab; then
+        echo "UUID=$UUID #{longhorn_default_fs_disk_path} ext4 defaults 0 2" >> /etc/fstab
+      fi
+      # Longhorn SPDK engine does not allow partition or filesystem on given disk
+      wipefs -a #{longhorn_default_blk_disk_device}
+      sgdisk --zap-all #{longhorn_default_blk_disk_device}
 
-    mount -a
+      mount -a
+    fi
     df -h
 
     echo 'System configurations'
@@ -266,9 +276,13 @@ provision_all_node_script = <<~SHELL
     chmod +x ./longhornctl
     mv ./longhornctl /usr/bin/
 
-    echo 'Prepare disks for Longhorn ...'
-    [[ -d #{longhorn_default_fs_disk_path} ]] && echo '  - default filesystem disk ready'
-    [[ -b #{longhorn_default_blk_disk_device} ]] && echo '  - default block disk ready'
+    if [ "${ROLE}" != "master" ]; then
+      echo 'Prepare disks for Longhorn ...'
+      [[ -d #{longhorn_default_fs_disk_path} ]] && echo '  - default filesystem disk ready'
+      [[ -b #{longhorn_default_blk_disk_device} ]] && echo '  - default block disk ready'
+    else
+      echo 'Skipping Longhorn data disk preparation on master'
+    fi
     SHELL
 
 provision_master_script = <<~SHELL
@@ -305,6 +319,7 @@ provision_master_script = <<~SHELL
     --bind-address=#{master_ip}
     --node-external-ip=#{master_ip}
     --node-taint='node-role.kubernetes.io/control-plane:NoSchedule'
+    --node-taint='node-role.kubernetes.io/master=true:NoExecute'
     --flannel-iface eth1
     #--disable-helm-controller
     )
@@ -328,7 +343,39 @@ provision_master_script = <<~SHELL
     chown vagrant:vagrant ~vagrant/.kube/config
 
     echo 'Post initialiing K3s ...'
-    kubectl -n kube-system patch deployment coredns -p '{"spec": {"template": {"spec": {"nodeSelector": {"node-role.kubernetes.io/control-plane": "true"}}}}}'
+    K8S_READY_TIMEOUT=$(( $(date +%s) + 300 ))
+    while [ "$(date +%s)" -lt "$K8S_READY_TIMEOUT" ] &&
+      ! kubectl -n kube-system get deployment coredns 2>/dev/null &&
+      kubectl get node "$NODE_NAME" 2>/dev/null; do
+      sleep 1
+    done
+    kubectl label node "$NODE_NAME" node-role.kubernetes.io/master=true --overwrite
+    kubectl -n kube-system patch deployment coredns \
+      --type='merge' \
+      -p '
+    {
+      "spec": {
+        "template": {
+          "spec": {
+            "nodeSelector": {
+              "node-role.kubernetes.io/control-plane": "true"
+            },
+            "tolerations": [
+              {
+                "key": "node-role.kubernetes.io/control-plane",
+                "operator": "Exists",
+                "effect": "NoSchedule"
+              },
+              {
+                "key": "node-role.kubernetes.io/master",
+                "operator": "Exists",
+                "effect": "NoExecute"
+              }
+            ]
+          }
+        }
+      }
+    }'
 
     echo 'Install CSI snapshot support ...'
     kubectl kustomize https://github.com/kubernetes-csi/external-snapshotter/client/config/crd | kubectl create -f -
@@ -345,14 +392,16 @@ provision_master_script = <<~SHELL
               "key": "node-role.kubernetes.io/control-plane",
               "operator": "Exists",
               "effect": "NoSchedule"
+            }, {
+              "key": "node-role.kubernetes.io/master",
+              "operator": "Exists",
+              "effect": "NoExecute"
             }
           ]
         }
       ]'
 
-    echo "Configuring Longhorn default disks on ${NODE_NAME} ..."
-    kubectl label node "$NODE_NAME" node.longhorn.io/create-default-disk=config
-    kubectl annotate node "$NODE_NAME" node.longhorn.io/default-disks-config='#{longhorn_master_node_default_disk_config.to_json}'
+    echo "Skipping Longhorn default disk config on master ${NODE_NAME}"
 
     #echo "Install Longhorn prerequisite dependencies ..."
     #longhornctl --image longhornio/longhorn-cli:#{longhorn_cli_image_version} install preflight --enable-spdk
@@ -444,7 +493,6 @@ provision_worker_script = <<~SHELL
 Vagrant.configure("2") do |config|
   config.vm.box = box_image
   #config.vm.provision "shell", inline: provision_cgroup_v1, reboot: true
-  config.vm.provision "shell", inline: provision_all_node_script
   config.vm.synced_folder "./shared", "/vagrant_shared", type: "virtiofs"
 
   config.vm.provider :libvirt do |provider|
@@ -507,24 +555,18 @@ Vagrant.configure("2") do |config|
       provider.disk_driver :cache => 'unsafe'
       provider.storage :file, {
         size: '100G',
-        device: 'vdd',
-      }
-      provider.storage :file, {
-        size: '200G',
-        device: 'vdc',
-        path: "extend1-#{master_host}.qcow2",
-      }
-      provider.storage :file, {
-        size: '200G',
         device: 'vdb',
-        path: "extend2-#{master_host}.qcow2",
       }
       #provider.management_network_keep = true
     end
+    master.vm.provision "master_node_setup",
+      type: "shell",
+      inline: provision_all_node_script,
+      env: { NODE_NAME: master_host, NODE_ROLE: "master" }
     master.vm.provision "master",
       type: "shell",
       inline: provision_master_script,
-      env: { NODE_NAME: master_host }
+      env: { NODE_NAME: master_host, NODE_ROLE: "master" }
   end
 
   workers.each do |worker_name, worker_ip|
@@ -563,11 +605,15 @@ Vagrant.configure("2") do |config|
         }
         #provider.management_network_keep = true
       end
-      worker.vm.provision "node_setup",
+      worker.vm.provision "worker_node_setup",
+        type: "shell",
+        inline: provision_all_node_script,
+        env: { NODE_IP: worker_ip, NODE_NAME: worker_name, NODE_ROLE: "worker" }
+      worker.vm.provision "worker",
         type: "shell",
         after: "master",
         inline: provision_worker_script,
-        env: { NODE_IP: worker_ip, NODE_NAME: worker_name }
+        env: { NODE_IP: worker_ip, NODE_NAME: worker_name, NODE_ROLE: "worker" }
     end
   end
 end

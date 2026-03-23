@@ -100,6 +100,9 @@ spec:
       - effect: NoSchedule
         key: node-role.kubernetes.io/control-plane
         operator: Exists
+      - effect: NoExecute
+        key: node-role.kubernetes.io/master
+        operator: Exists
       volumes:
       - name: minio-volume
         emptyDir: {}
