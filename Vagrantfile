@@ -590,8 +590,7 @@ Vagrant.configure("2") do |config|
       trigger.name = "Create libvirt network"
       trigger.info = "Ensuring libvirt network exists"
       trigger.run = {
-        # IPv6: use the dual-stack network creation script
-        inline: "bash create_libvirt_network_dualstack.sh #{libvirt_network_name} #{libvirt_network_interface} #{libvirt_network_subnet_ipv4} #{libvirt_network_subnet_ipv6}",
+        inline: "bash create_libvirt_network.sh #{libvirt_network_name} #{libvirt_network_interface} #{libvirt_network_subnet_ipv4} #{libvirt_network_subnet_ipv6} #{network_stack}",
       }
     end
     master.trigger.after :up do |trigger|
