@@ -37,3 +37,6 @@ Sessionx.vim
 .vagrant
 /shared/*
 !/shared/.gitkeep
+
+*.key
+*.crt
