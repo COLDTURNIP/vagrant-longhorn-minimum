@@ -212,6 +212,39 @@ longhorn_master_node_default_disk_config = [
   },
 ]
 
+# Single source of truth for Longhorn default settings.
+# Keys: kebab-case (native Longhorn format).
+# Values: YAML value strings as they appear after the colon (e.g. "\"true\"", "'{\\"v2\\": \\"false\\"}'").
+# Used to generate both the embedded ConfigMap and longhorn-values.yaml.
+longhorn_default_settings = {
+  "create-default-disk-labeled-nodes"            => %q("true"),
+  "v2-data-engine"                               => "\"#{enable_longhorn_v2_engine}\"",
+  "data-engine-hugepage-enabled"                 => %q('{"v2": "false"}'),
+  "data-engine-interrupt-mode-enabled"           => %q('{"v2": "true"}'),
+  "deleting-confirmation-flag"                   => %q("true"),
+  "storage-reserved-percentage-for-default-disk" => %q("0"),
+  "allow-collecting-longhorn-usage-metrics"      => %q("false"),
+  "backup-target"                                => %q("s3://backupbucket@us-east-1/"),
+  "backup-target-credential-secret"              => %q("longhorn-backup-target-secret"),
+}
+
+kebab_to_camel = ->(key) {
+  parts = key.split('-')
+  parts[0] + parts[1..].map { |p| p.capitalize }.join
+}
+
+# 4-space-indented lines for the default-setting.yaml block scalar (backup-* excluded).
+longhorn_configmap_setting_lines = longhorn_default_settings
+  .reject { |k, _| k.start_with?("backup-") }
+  .map    { |k, v| "    #{k}: #{v}" }
+  .join("\n")
+
+# 4-space-indented lines for the default-resource.yaml block scalar (backup-* only, quoted keys).
+longhorn_configmap_resource_lines = longhorn_default_settings
+  .select { |k, _| k.start_with?("backup-") }
+  .map    { |k, v| "    \"#{k}\": #{v}" }
+  .join("\n")
+
 # Cgroup v1 for legacy K8s support. Rebooting needed.
 provision_cgroup_v1 = <<~SHELL
     sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="[^"]*/& systemd.unified_cgroup_hierarchy=false cgroup_enable=memory cgroup_enable=cpuset cgroup_memory=1/' /etc/default/grub
@@ -499,13 +532,7 @@ provision_master_script = <<~SHELL
       namespace: longhorn-system
     data:
       default-setting.yaml: |-
-        create-default-disk-labeled-nodes: "true"
-        v2-data-engine: "#{enable_longhorn_v2_engine}"
-        data-engine-hugepage-enabled: '{"v2": "false"}'
-        data-engine-interrupt-mode-enabled: '{"v2": "true"}'
-        deleting-confirmation-flag: "true"
-        storage-reserved-percentage-for-default-disk: "0"
-        allow-collecting-longhorn-usage-metrics: "false"
+    #{longhorn_configmap_setting_lines}
     ---
     apiVersion: v1
     kind: ConfigMap
@@ -514,8 +541,7 @@ provision_master_script = <<~SHELL
       namespace: longhorn-system
     data:
       default-resource.yaml: |
-        "backup-target": "s3://backupbucket@us-east-1/"
-        "backup-target-credential-secret": "longhorn-backup-target-secret"
+    #{longhorn_configmap_resource_lines}
     YAML
 
     fi
@@ -586,6 +612,24 @@ Vagrant.configure("2") do |config|
   #end
 
   config.vm.define master_host, primary: true do |master|
+    master.trigger.before :up do |trigger|
+      trigger.name = "Generate longhorn-values.yaml"
+      trigger.ruby do |env, machine|
+        lines = ["defaultSettings:"]
+        longhorn_default_settings.each do |k, v|
+          camel = k.split('-').each_with_index.map { |p, i| i == 0 ? p : p.capitalize }.join
+          lines << "  #{camel}: #{v}"
+        end
+        lines << "longhornUI:"
+        lines << "  tolerations:"
+        lines << "  - effect: NoSchedule"
+        lines << "    key: node-role.kubernetes.io/control-plane"
+        lines << "    operator: Exists"
+        out = File.join(env.cwd.to_s, "shared", "longhorn-values.yaml")
+        File.write(out, lines.join("\n") + "\n")
+        puts "Generated #{out}"
+      end
+    end
     master.trigger.before :up do |trigger|
       trigger.name = "Create libvirt network"
       trigger.info = "Ensuring libvirt network exists"
