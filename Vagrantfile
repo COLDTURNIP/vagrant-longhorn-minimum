@@ -588,6 +588,9 @@ provision_worker_script = <<~SHELL
     kubectl annotate node "$NODE_NAME" node.longhorn.io/default-disks-config='#{longhorn_worker_node_default_disk_config.to_json}'
     SHELL
 
+def cwd_path(env, *parts);    File.join(env.cwd.to_s, *parts);           end
+def shared_path(env, *parts); File.join(env.cwd.to_s, "shared", *parts); end
+
 Vagrant.configure("2") do |config|
   config.vm.box = box_image
   #config.vm.provision "shell", inline: provision_cgroup_v1, reboot: true
@@ -599,7 +602,7 @@ Vagrant.configure("2") do |config|
 
   config.trigger.after :status do |trigger|
     trigger.ruby do | env, machine |
-      puts "Kubernetes KUBECONFIG: #{env.cwd}/shared/#{kubeconfig_file}"
+      puts "Kubernetes KUBECONFIG: #{shared_path(env, kubeconfig_file)}"
     end
   end
 
@@ -629,7 +632,7 @@ Vagrant.configure("2") do |config|
         lines << "  - effect: NoSchedule"
         lines << "    key: node-role.kubernetes.io/control-plane"
         lines << "    operator: Exists"
-        out = File.join(env.cwd.to_s, "shared", "longhorn-values.yaml")
+        out = shared_path(env, "longhorn-values.yaml")
         File.write(out, lines.join("\n") + "\n")
         puts "Generated #{out}"
       end
@@ -637,14 +640,16 @@ Vagrant.configure("2") do |config|
     master.trigger.before :up do |trigger|
       trigger.name = "Create libvirt network"
       trigger.info = "Ensuring libvirt network exists"
-      trigger.run = {
-        inline: "bash create_libvirt_network.sh #{libvirt_network_name} #{libvirt_network_interface} #{libvirt_network_subnet_ipv4} #{libvirt_network_subnet_ipv6} #{network_stack}",
-      }
+      trigger.ruby do |env, machine|
+        script = cwd_path(env, "create_libvirt_network.sh")
+        system("bash", script, libvirt_network_name, libvirt_network_interface,
+               libvirt_network_subnet_ipv4, libvirt_network_subnet_ipv6, network_stack)
+      end
     end
     master.trigger.after :up do |trigger|
       trigger.name = "Kubernetes cluster Information"
       trigger.ruby do | env, machine |
-        puts "Kubernetes cluster available with KUBECONFIG=#{env.cwd}/shared/#{kubeconfig_file}"
+        puts "Kubernetes cluster available with KUBECONFIG=#{shared_path(env, kubeconfig_file)}"
       end
     end
     master.trigger.after :destroy do |trigger|
@@ -693,9 +698,11 @@ Vagrant.configure("2") do |config|
       worker.trigger.before :up do |trigger|
         trigger.name = "Wait master node"
         trigger.info = "Wait for Kubernetes API server"
-        trigger.run = {
-          inline: "bash wait_k8s.sh shared/#{kubeconfig_file} 600",
-        }
+        trigger.ruby do |env, machine|
+          script = cwd_path(env, "wait_k8s.sh")
+          kubeconfig = shared_path(env, kubeconfig_file)
+          system("bash", script, kubeconfig, "600")
+        end
       end
       worker.vm.network :private_network,
         libvirt__network_name: libvirt_network_name,
