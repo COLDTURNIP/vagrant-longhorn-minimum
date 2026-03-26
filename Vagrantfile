@@ -151,7 +151,11 @@ workers = {
 
 # K3s addresses and flags derived from network_stack. Do not edit these directly.
 master_bind_ip        = (network_stack == "ipv6" || network_stack == "dual6") ? master_ipv6 : master_ip
-master_node_ip        = (network_stack == "dual" || network_stack == "dual6") ? "#{master_ip},#{master_ipv6}" : master_bind_ip
+master_node_ip        = case network_stack
+                         when "dual"  then "#{master_ip},#{master_ipv6}"
+                         when "dual6" then "#{master_ipv6},#{master_ip}"
+                         else              master_bind_ip
+                         end
 master_server_url     = (network_stack == "ipv6" || network_stack == "dual6") ? "https://[#{master_ipv6}]:6443" : "https://#{master_ip}:6443"
 k3s_cluster_cidr      = case network_stack
                          when "ipv6"  then "fd42::/48"
@@ -720,8 +724,12 @@ Vagrant.configure("2") do |config|
         }
         #provider.management_network_keep = true
       end
-      worker_bind_ip = network_stack == "ipv6" ? worker_ipv6 : worker_ip
-      worker_node_ip = (network_stack == "dual" || network_stack == "dual6") ? "#{worker_ip},#{worker_ipv6}" : worker_bind_ip
+      worker_bind_ip = (network_stack == "ipv6" || network_stack == "dual6") ? worker_ipv6 : worker_ip
+      worker_node_ip = case network_stack
+                       when "dual"  then "#{worker_ip},#{worker_ipv6}"
+                       when "dual6" then "#{worker_ipv6},#{worker_ip}"
+                       else              worker_bind_ip
+                       end
       worker.vm.provision "worker_node_setup",
         type: "shell",
         inline: provision_all_node_script,
