@@ -8,22 +8,26 @@ require 'yaml'
 # Prerequisite
 # ============
 #
-# Follow the Vagrant installation guide to setup Vagrant with VirtualBox.
-# https://developer.hashicorp.com/vagrant/docs/installation
+# Same as Vagrantfile but with dual-stack (IPv4 + IPv6 ULA) support.
+# Every node gets an additional IPv6 address on eth1 from the ULA prefix
+# fd00:dead:beef::/64.  K3s is configured for dual-stack.
 #
-# ## VM Provider ##
+# To bring up the cluster:
 #
-# Make sure that libvirt and qemu are installed, and KVM is enabled. To OpenSUSE:
+#   vagrant up
 #
-#   $ sudo zypper install libvirt qemu virt-manager libvirt-daemon-driver-qemu qemu-kvm
+# To force-destroy and recreate the libvirt network (needed when switching
+# from the single-stack Vagrantfile for the first time):
 #
-# And install the Vagrant with libvirt provider plugin:
-# https://vagrant-libvirt.github.io/vagrant-libvirt/installation.html
+#   virsh net-destroy vagrant-longhorn
+#   virsh net-undefine vagrant-longhorn
+#   vagrant up
 #
-# Alternatively, it is even more recommended to make good use of containerized Vagrant with libvirt:
-# https://vagrant-libvirt.github.io/vagrant-libvirt/installation.html#docker--podman
+# The kubeconfig will be at shared/libvirt-ubuntu-k3s.config as usual.
+# Verify dual-stack is working after `vagrant up`:
 #
-# ## Libvirt Network ##
+#   KUBECONFIG=shared/libvirt-ubuntu-k3s.config kubectl get nodes -o wide
+#   # InternalIP should show both 192.168.156.x and fd00:dead:beef::x
 #
 # A Libvirt network "vagrant-longhorn" will be generated automatcially, and
 # join the "trusted" firewalld zone. Make sure the Libvirt is built with
@@ -88,8 +92,8 @@ k3s_version = "v1.34.2+k3s1"
 #k3s_version = "v1.33.10+k3s1"
 #k3s_version = "latest"
 #k3s_version = "v1.13.4+k3s1"
-longhorn_version = ''
-#longhorn_version = 'master'
+#longhorn_version = ''
+longhorn_version = 'master'
 #longhorn_version = 'v1.11.0'
 #longhorn_version = 'v1.10.2'
 #longhorn_version = 'v1.9.2'
@@ -110,20 +114,63 @@ end
 
 libvirt_network_name = "vagrant-longhorn"
 libvirt_network_interface = "virbr1"
-libvirt_network_subnet = "192.168.156"
+libvirt_network_subnet_ipv4 = "192.168.156"
 libvirt_network_firewalld_zone = "trusted"
 
+# IPv6: ULA prefix for the storage network.
+# All nodes get fd00:dead:beef::<last-octet-of-ipv4>/64.
+# This prefix is routable only within the cluster (Unique Local Address).
+libvirt_network_subnet_ipv6 = "fd00:dead:beef"
+
+# Network stack selection. Requires `vagrant destroy -f && vagrant up` to apply.
+#   "ipv6"  - IPv6-only node addresses, pod CIDRs, and service CIDRs.
+#   "ipv4"  - IPv4-only (original single-stack behaviour).
+#   "dual"  - Dual-stack: IPv4-first CIDRs (10.42.0.0/16,fd42::/48).
+#             API server binds to IPv4; --node-ip carries both families.
+#             pod.Status.podIP will be IPv4.
+#   "dual6" - Dual-stack: IPv6-first CIDRs (fd42::/48,10.42.0.0/16).
+#             API server binds to IPv4; --node-ip carries both families.
+#             pod.Status.podIP will be IPv6 (primary family from first CIDR).
+#             Used to test data-engine-ip-family=ipv4 on an IPv6-first cluster.
+#network_stack = "ipv6"
+#network_stack = "ipv4"
+#network_stack = "dual"
+network_stack = "dual6"
+
 master_host = "libvirt-ubuntu-k3s-master"
-master_ip = "#{libvirt_network_subnet}.20"
-master_cpu = "2"
+master_ip   = "#{libvirt_network_subnet_ipv4}.20"
+master_ipv6 = "#{libvirt_network_subnet_ipv6}::20"  # IPv6: master storage IPv6
+master_cpu  = "2"
 master_memory = "3072"
 
-workers = { "libvirt-ubuntu-k3s-worker1" => "#{libvirt_network_subnet}.21",
-            "libvirt-ubuntu-k3s-worker2" => "#{libvirt_network_subnet}.22",
-            "libvirt-ubuntu-k3s-worker3" => "#{libvirt_network_subnet}.23",
-            #"libvirt-arch-k3s-worker2" => "#{libvirt_network_subnet}.32",
-            #"libvirt-arch-k3s-worker3" => "#{libvirt_network_subnet}.33",
-           }
+workers = {
+  "libvirt-ubuntu-k3s-worker1" => { ip: "#{libvirt_network_subnet_ipv4}.21", ipv6: "#{libvirt_network_subnet_ipv6}::21" },
+  "libvirt-ubuntu-k3s-worker2" => { ip: "#{libvirt_network_subnet_ipv4}.22", ipv6: "#{libvirt_network_subnet_ipv6}::22" },
+  "libvirt-ubuntu-k3s-worker3" => { ip: "#{libvirt_network_subnet_ipv4}.23", ipv6: "#{libvirt_network_subnet_ipv6}::23" },
+}
+
+# K3s addresses and flags derived from network_stack. Do not edit these directly.
+master_bind_ip        = (network_stack == "ipv6" || network_stack == "dual6") ? master_ipv6 : master_ip
+master_node_ip        = (network_stack == "dual" || network_stack == "dual6") ? "#{master_ip},#{master_ipv6}" : master_bind_ip
+master_server_url     = (network_stack == "ipv6" || network_stack == "dual6") ? "https://[#{master_ipv6}]:6443" : "https://#{master_ip}:6443"
+k3s_cluster_cidr      = case network_stack
+                         when "ipv6"  then "fd42::/48"
+                         when "dual"  then "10.42.0.0/16,fd42::/48"
+                         when "dual6" then "fd42::/48,10.42.0.0/16"
+                         else              "10.42.0.0/16"
+                         end
+# NOTE: kube-apiserver requires (1) cluster-cidr and service-cidr primary family match,
+# and (2) the primary family must match the advertise-address family.
+# For "dual6": bind/advertise on IPv6 (fd00:dead:beef::20), both CIDRs IPv6-first.
+# This makes pod.Status.podIP=IPv6; kubeconfig API server URL uses IPv6.
+k3s_service_cidr      = case network_stack
+                         when "ipv6"  then "fd43::/112"
+                         when "dual"  then "10.43.0.0/16,fd43::/112"
+                         when "dual6" then "fd43::/112,10.43.0.0/16"
+                         else              "10.43.0.0/16"
+                         end
+k3s_flannel_ipv6_masq = (network_stack == "ipv6" || network_stack == "dual" || network_stack == "dual6") ? "--flannel-ipv6-masq" : "#--flannel-ipv6-masq (ipv4 mode)"
+
 worker_cpu = "3"
 worker_memory = "3584"
 
@@ -143,7 +190,7 @@ longhorn_worker_node_default_disk_config = [
     "storageReserved" => 0,
   },
   {
-    "name" => "default-v2-disk", 
+    "name" => "default-v2-disk",
     "path" => longhorn_default_blk_disk_device,
     "allowScheduling" => true,
     "diskType" => "block",
@@ -157,7 +204,7 @@ longhorn_master_node_default_disk_config = [
     "storageReserved" => 0,
   },
   {
-    "name" => "default-v2-disk", 
+    "name" => "default-v2-disk",
     "path" => longhorn_default_blk_disk_device,
     "allowScheduling" => false,
     "diskType" => "block",
@@ -276,6 +323,22 @@ provision_all_node_script = <<~SHELL
     chmod +x ./longhornctl
     mv ./longhornctl /usr/bin/
 
+    # IPv6: Assign static ULA address to the storage interface (eth1).
+    # We write a netplan fragment so the address survives reboots.
+    # The file only declares the IPv6 address; Vagrant manages the IPv4 side.
+    # NOTE: printf is used instead of a heredoc to avoid a zero-indented
+    # closing delimiter (e.g. NETPLAN) that would cause Ruby <<~SHELL to
+    # strip 0 chars from all lines, breaking the LOGROTATE_CONFIG heredoc.
+    if [[ -n "${NODE_IPV6}" ]]; then
+      echo "IPv6: assigning ${NODE_IPV6}/64 to eth1"
+      printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses:\n        - "%s/64"\n' \
+        "${NODE_IPV6}" >/etc/netplan/60-eth1-ipv6.yaml
+      chmod 600 /etc/netplan/60-eth1-ipv6.yaml
+      netplan apply
+      echo "IPv6: current eth1 addresses:"
+      ip -6 addr show eth1
+    fi
+
     if [ "${ROLE}" != "master" ]; then
       echo 'Prepare disks for Longhorn ...'
       [[ -d #{longhorn_default_fs_disk_path} ]] && echo '  - default filesystem disk ready'
@@ -316,12 +379,16 @@ provision_master_script = <<~SHELL
     --kube-apiserver-arg=default-unreachable-toleration-seconds=30
     --kube-apiserver-arg=audit-log-path=-
     --kube-apiserver-arg=audit-policy-file="$K3S_AUDIT_POLICY_FILE"
-    --bind-address=#{master_ip}
-    --node-external-ip=#{master_ip}
+    --bind-address=#{master_bind_ip}
+    --node-external-ip=#{master_node_ip}
     --node-taint='node-role.kubernetes.io/control-plane:NoSchedule'
     --node-taint='node-role.kubernetes.io/master=true:NoExecute'
     --flannel-iface eth1
     #--disable-helm-controller
+    --cluster-cidr=#{k3s_cluster_cidr}
+    --service-cidr=#{k3s_service_cidr}
+    --node-ip=#{master_node_ip}
+    #{k3s_flannel_ipv6_masq}
     )
 
     export K3S_KUBECONFIG_MODE="644"
@@ -406,7 +473,7 @@ provision_master_script = <<~SHELL
     #echo "Install Longhorn prerequisite dependencies ..."
     #longhornctl --image longhornio/longhorn-cli:#{longhorn_cli_image_version} install preflight --enable-spdk
 
-    if [[ -n "${longhorn_version}" ]]; then
+    if [[ -n "#{longhorn_version}" ]]; then
       echo "Install Longhorn #{longhorn_version} on ${NODE_NAME} ..."
       kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/#{longhorn_version}/deploy/longhorn.yaml
       echo 'Longhorn #{longhorn_version} installed. It would take several minutes for pods get ready.'
@@ -432,13 +499,13 @@ provision_master_script = <<~SHELL
       namespace: longhorn-system
     data:
       default-setting.yaml: |-
-        "create-default-disk-labeled-nodes": "true",
-        "v2-data-engine": "#{enable_longhorn_v2_engine}",
-        "data-engine-hugepage-enabled": '{"v2": "false"}',
-        "data-engine-interrupt-mode-enabled": '{"v2": "true"}',
-        "deleting-confirmation-flag": "true",
-        "storage-reserved-percentage-for-default-disk": "0",
-        "allow-collecting-longhorn-usage-metrics": "false",
+        create-default-disk-labeled-nodes: "true"
+        v2-data-engine: "#{enable_longhorn_v2_engine}"
+        data-engine-hugepage-enabled: '{"v2": "false"}'
+        data-engine-interrupt-mode-enabled: '{"v2": "true"}'
+        deleting-confirmation-flag: "true"
+        storage-reserved-percentage-for-default-disk: "0"
+        allow-collecting-longhorn-usage-metrics: "false"
     ---
     apiVersion: v1
     kind: ConfigMap
@@ -462,14 +529,15 @@ provision_worker_script = <<~SHELL
     --token "#{k3s_token}"
     --kubelet-arg=node-status-update-frequency=5s
     --kubelet-arg=hairpin-mode=promiscuous-bridge
-    --server https://#{master_ip}:6443
+    --server #{master_server_url}
     --flannel-iface eth1
     )
 
-    if [[ -n "${NODE_IP}" ]]; then
+    if [[ -n "${NODE_BIND_IP}" ]]; then
       INSTALL_K3S_ARGS+=(
-        --bind-address=${NODE_IP}
-        --node-external-ip=${NODE_IP}
+        --bind-address=${NODE_BIND_IP}
+        --node-external-ip=${NODE_NODE_IP:-${NODE_BIND_IP}}
+        --node-ip=${NODE_NODE_IP:-${NODE_BIND_IP}}
       )
     fi
 
@@ -522,7 +590,8 @@ Vagrant.configure("2") do |config|
       trigger.name = "Create libvirt network"
       trigger.info = "Ensuring libvirt network exists"
       trigger.run = {
-        inline: "bash create_libvirt_network.sh #{libvirt_network_name} #{libvirt_network_interface} #{libvirt_network_subnet}",
+        # IPv6: use the dual-stack network creation script
+        inline: "bash create_libvirt_network_dualstack.sh #{libvirt_network_name} #{libvirt_network_interface} #{libvirt_network_subnet_ipv4} #{libvirt_network_subnet_ipv6}",
       }
     end
     master.trigger.after :up do |trigger|
@@ -562,14 +631,17 @@ Vagrant.configure("2") do |config|
     master.vm.provision "master_node_setup",
       type: "shell",
       inline: provision_all_node_script,
-      env: { NODE_NAME: master_host, NODE_ROLE: "master" }
+      env: { NODE_NAME: master_host, NODE_ROLE: "master",
+             NODE_IPV6: (network_stack == "ipv6" || network_stack == "dual" || network_stack == "dual6") ? master_ipv6 : "" }
     master.vm.provision "master",
       type: "shell",
       inline: provision_master_script,
       env: { NODE_NAME: master_host, NODE_ROLE: "master" }
   end
 
-  workers.each do |worker_name, worker_ip|
+  workers.each do |worker_name, worker_addrs|
+    worker_ip   = worker_addrs[:ip]
+    worker_ipv6 = worker_addrs[:ipv6]
     config.vm.define worker_name do |worker|
       worker.trigger.before :up do |trigger|
         trigger.name = "Wait master node"
@@ -605,15 +677,22 @@ Vagrant.configure("2") do |config|
         }
         #provider.management_network_keep = true
       end
+      worker_bind_ip = network_stack == "ipv6" ? worker_ipv6 : worker_ip
+      worker_node_ip = (network_stack == "dual" || network_stack == "dual6") ? "#{worker_ip},#{worker_ipv6}" : worker_bind_ip
       worker.vm.provision "worker_node_setup",
         type: "shell",
         inline: provision_all_node_script,
-        env: { NODE_IP: worker_ip, NODE_NAME: worker_name, NODE_ROLE: "worker" }
+        env: { NODE_IP: worker_ip, NODE_NAME: worker_name, NODE_ROLE: "worker",
+               NODE_IPV6:    (network_stack == "ipv6" || network_stack == "dual" || network_stack == "dual6") ? worker_ipv6 : "",
+               NODE_BIND_IP: worker_bind_ip }
       worker.vm.provision "worker",
         type: "shell",
         after: "master",
         inline: provision_worker_script,
-        env: { NODE_IP: worker_ip, NODE_NAME: worker_name, NODE_ROLE: "worker" }
+        env: { NODE_IP: worker_ip, NODE_NAME: worker_name, NODE_ROLE: "worker",
+               NODE_IPV6:    (network_stack == "ipv6" || network_stack == "dual" || network_stack == "dual6") ? worker_ipv6 : "",
+               NODE_BIND_IP: worker_bind_ip,
+               NODE_NODE_IP: worker_node_ip }
     end
   end
 end
