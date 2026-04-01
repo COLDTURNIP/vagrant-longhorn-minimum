@@ -250,6 +250,12 @@ longhorn_configmap_resource_lines = longhorn_default_settings
   .map    { |k, v| "    \"#{k}\": #{v}" }
   .join("\n")
 
+# All node IPs for the Minio TLS cert SAN so the cert is valid for access from any node.
+minio_san_ips = [master_ip] + workers.values.map { |w| w[:ip] }
+if network_stack =~ /ipv6|dual/
+  minio_san_ips += [master_ipv6] + workers.values.map { |w| w[:ipv6] }
+end
+
 # Cgroup v1 for legacy K8s support. Rebooting needed.
 provision_cgroup_v1 = <<~SHELL
     sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="[^"]*/& systemd.unified_cgroup_hierarchy=false cgroup_enable=memory cgroup_enable=cpuset cgroup_memory=1/' /etc/default/grub
@@ -550,6 +556,12 @@ provision_master_script = <<~SHELL
     YAML
 
     fi
+
+    echo "Deploy Minio backup store ..."
+    kubectl create namespace longhorn-system 2>/dev/null || true
+    (cd /tmp && MINIO_SAN_IPS="#{minio_san_ips.join(',')}" KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /vagrant/deploy_minio.sh)
+    kubectl -n default rollout status deploy/longhorn-backup-target --timeout=180s
+    echo "Minio backup store ready: s3://backupbucket@us-east-1/ secret=longhorn-backup-target-secret"
 
     SHELL
 

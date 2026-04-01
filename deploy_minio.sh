@@ -4,20 +4,27 @@
 VAGRANT_CMD=${VAGRANT_CMD:-vagrant}
 NAME=${1:-longhorn-backup-target}
 
-hosts=( $( ${VAGRANT_CMD} status --machine-readable | cut -d',' -f2 2>/dev/null | sort | uniq ) )
-if [[ $hosts == '' ]]; then
-  echo 'Error: no Vagrant instance detected. Check the vagrantfile and the instance provisioning.'
-  exit 1
-fi
-
 host_ips=()
 san_ip=''
-for host in ${hosts[@]} ; do
-  host_ip=$(${VAGRANT_CMD} ssh $host -- "hostname -I | cut -d' ' -f2" 2>/dev/null | tr -d '\r')
-  echo "host ${host} IP: '${host_ip}'"
-  host_ips+=($host_ip)
-  san_ip="${san_ip},IP:${host_ip}"
-done
+if [[ -n "${MINIO_SAN_IPS}" ]]; then
+  # IPs provided directly (e.g., called from inside a Vagrant provisioner).
+  IFS=',' read -ra host_ips <<< "${MINIO_SAN_IPS}"
+  for ip in "${host_ips[@]}"; do
+    san_ip="${san_ip},IP:${ip}"
+  done
+else
+  hosts=( $( ${VAGRANT_CMD} status --machine-readable | cut -d',' -f2 2>/dev/null | sort | uniq ) )
+  if [[ $hosts == '' ]]; then
+    echo 'Error: no Vagrant instance detected. Check the vagrantfile and the instance provisioning.'
+    exit 1
+  fi
+  for host in ${hosts[@]} ; do
+    host_ip=$(${VAGRANT_CMD} ssh $host -- "hostname -I | cut -d' ' -f2" 2>/dev/null | tr -d '\r')
+    echo "host ${host} IP: '${host_ip}'"
+    host_ips+=($host_ip)
+    san_ip="${san_ip},IP:${host_ip}"
+  done
+fi
 
 # Variables
 SERVICE=${NAME}-service
