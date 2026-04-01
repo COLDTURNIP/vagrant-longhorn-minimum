@@ -88,7 +88,8 @@ require 'yaml'
 box_image = "bento/ubuntu-24.04"
 #box_image = "generic/ubuntu2004"
 
-k3s_version = "v1.34.2+k3s1"
+#k3s_version = "v1.34.2+k3s1"  # incompatible with longhorn-manager master-head (client-go v0.35 WatchListClient issue)
+k3s_version = "v1.33.1+k3s1"
 #k3s_version = "v1.33.10+k3s1"
 #k3s_version = "latest"
 #k3s_version = "v1.13.4+k3s1"
