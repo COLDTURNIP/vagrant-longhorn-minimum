@@ -88,11 +88,18 @@ require 'yaml'
 box_image = "bento/ubuntu-24.04"
 #box_image = "generic/ubuntu2004"
 
+#k3s_version = "latest"
 #k3s_version = "v1.34.2+k3s1"  # incompatible with longhorn-manager master-head (client-go v0.35 WatchListClient issue)
 k3s_version = "v1.33.1+k3s1"
 #k3s_version = "v1.33.10+k3s1"
-#k3s_version = "latest"
+#k3s_version = "v1.23.17+k3s1"
 #k3s_version = "v1.13.4+k3s1"
+# Direct binary URL for the air-gap probe (see provision_worker_script).
+# "latest" uses GitHub's redirect endpoint; specific versions encode + as %2B.
+k3s_bin_url = k3s_version == "latest" \
+  ? "https://github.com/k3s-io/k3s/releases/latest/download/k3s" \
+  : "https://github.com/k3s-io/k3s/releases/download/#{k3s_version.gsub('+', '%2B')}/k3s"
+
 #longhorn_version = ''
 longhorn_version = 'master'
 #longhorn_version = 'v1.11.0'
@@ -134,9 +141,9 @@ libvirt_network_subnet_ipv6 = "fd00:dead:beef"
 #             pod.Status.podIP will be IPv6 (primary family from first CIDR).
 #             Used to test data-engine-ip-family=ipv4 on an IPv6-first cluster.
 #network_stack = "ipv6"
-#network_stack = "ipv4"
+network_stack = "ipv4"
 #network_stack = "dual"
-network_stack = "dual6"
+#network_stack = "dual6"
 
 master_host = "libvirt-ubuntu-k3s-master"
 master_ip   = "#{libvirt_network_subnet_ipv4}.20"
@@ -576,16 +583,27 @@ provision_worker_script = <<~SHELL
     --flannel-iface eth1
     )
 
+    # Download the k3s binary directly (air-gap method) to probe for flag support
+    # before finalising INSTALL_K3S_ARGS, without triggering a full installation.
+    curl -sfL "#{k3s_bin_url}" -o /usr/local/bin/k3s
+    chmod +x /usr/local/bin/k3s
+
+    # --bind-address was added to k3s agent after v1.23; probe the installed binary so
+    # the flag is only included on versions that actually support it (IPv6/dual-stack).
     if [[ -n "${NODE_BIND_IP}" ]]; then
       INSTALL_K3S_ARGS+=(
-        --bind-address=${NODE_BIND_IP}
         --node-external-ip=${NODE_NODE_IP:-${NODE_BIND_IP}}
         --node-ip=${NODE_NODE_IP:-${NODE_BIND_IP}}
       )
+      if k3s agent --help 2>&1 | grep -q -- '--bind-address'; then
+        INSTALL_K3S_ARGS+=(--bind-address=${NODE_BIND_IP})
+      fi
     fi
 
     export K3S_TOKEN="#{k3s_token}" K3S_KUBECONFIG_MODE="644"
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="#{k3s_version}" INSTALL_K3S_EXEC="agent" sh -s - "${INSTALL_K3S_ARGS[@]}"
+    # Binary already in place from the air-gap download; INSTALL_K3S_SKIP_DOWNLOAD tells
+    # the installer to skip the download and use the existing binary at /usr/local/bin/k3s.
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="#{k3s_version}" INSTALL_K3S_EXEC="agent" INSTALL_K3S_SKIP_DOWNLOAD=true sh -s - "${INSTALL_K3S_ARGS[@]}"
 
     echo 'Preparing default Kubectl configurations ...'
     mkdir -p ~vagrant/.kube
