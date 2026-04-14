@@ -141,9 +141,15 @@ libvirt_network_subnet_ipv6 = "fd00:dead:beef"
 #             pod.Status.podIP will be IPv6 (primary family from first CIDR).
 #             Used to test data-engine-ip-family=ipv4 on an IPv6-first cluster.
 #network_stack = "ipv6"
-network_stack = "ipv4"
-#network_stack = "dual"
+#network_stack = "ipv4"
+network_stack = "dual"
 #network_stack = "dual6"
+
+# Backup target selection. Requires `vagrant destroy -f && vagrant up` to apply.
+#   "minio" - S3-compatible object storage (default)
+#   "nfs"   - NFS server (use to reproduce NFS-specific issues such as longhorn/longhorn#12896)
+#backup_target = "nfs"
+backup_target = "minio"
 
 master_host = "libvirt-ubuntu-k3s-master"
 master_ip   = "#{libvirt_network_subnet_ipv4}.20"
@@ -236,9 +242,11 @@ longhorn_default_settings = {
   "deleting-confirmation-flag"                   => %q("true"),
   "storage-reserved-percentage-for-default-disk" => %q("0"),
   "allow-collecting-longhorn-usage-metrics"      => %q("false"),
-  "backup-target"                                => %q("s3://backupbucket@us-east-1/"),
-  "backup-target-credential-secret"              => %q("longhorn-backup-target-secret"),
+  "backup-target"                                => backup_target == "nfs" \
+    ? %q("nfs://longhorn-test-nfs-svc.default:/opt/backupstore") \
+    : %q("s3://backupbucket@us-east-1/"),
 }
+longhorn_default_settings["backup-target-credential-secret"] = %q("longhorn-backup-target-secret") if backup_target != "nfs"
 
 kebab_to_camel = ->(key) {
   parts = key.split('-')
@@ -564,11 +572,18 @@ provision_master_script = <<~SHELL
 
     fi
 
-    echo "Deploy Minio backup store ..."
-    kubectl create namespace longhorn-system 2>/dev/null || true
-    (cd /tmp && MINIO_SAN_IPS="#{minio_san_ips.join(',')}" KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /vagrant/deploy_minio.sh)
-    kubectl -n default rollout status deploy/longhorn-backup-target --timeout=180s
-    echo "Minio backup store ready: s3://backupbucket@us-east-1/ secret=longhorn-backup-target-secret"
+    if [[ "#{backup_target}" == "nfs" ]]; then
+      echo "Deploy NFS backup store ..."
+      (cd /tmp && KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /vagrant/deploy_nfs.sh)
+      kubectl -n default rollout status deploy/longhorn-test-nfs --timeout=180s
+      echo "NFS backup store ready: nfs://longhorn-test-nfs-svc.default:/opt/backupstore"
+    else
+      echo "Deploy Minio backup store ..."
+      kubectl create namespace longhorn-system 2>/dev/null || true
+      (cd /tmp && MINIO_SAN_IPS="#{minio_san_ips.join(',')}" KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /vagrant/deploy_minio.sh)
+      kubectl -n default rollout status deploy/longhorn-backup-target --timeout=180s
+      echo "Minio backup store ready: s3://backupbucket@us-east-1/ secret=longhorn-backup-target-secret"
+    fi
 
     SHELL
 
