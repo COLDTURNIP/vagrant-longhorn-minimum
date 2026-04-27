@@ -140,10 +140,10 @@ libvirt_network_subnet_ipv6 = "fd00:dead:beef"
 #             API server binds to IPv4; --node-ip carries both families.
 #             pod.Status.podIP will be IPv6 (primary family from first CIDR).
 #             Used to test data-engine-ip-family=ipv4 on an IPv6-first cluster.
-#network_stack = "ipv6"
+network_stack = "ipv6"
 #network_stack = "ipv4"
 #network_stack = "dual"
-network_stack = "dual6"
+#network_stack = "dual6"
 
 # Backup target selection. Requires `vagrant destroy -f && vagrant up` to apply.
 #   "minio" - S3-compatible object storage (default)
@@ -407,6 +407,7 @@ provision_all_node_script = <<~SHELL
     fi
 
     # kernel modules for SPDK
+    modprobe nvme_tcp
     echo nvme_tcp | sudo tee /etc/modules-load.d/nvme_tcp.conf
     SHELL
 
