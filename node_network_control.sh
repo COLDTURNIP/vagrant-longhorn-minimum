@@ -71,16 +71,16 @@ if [[ -z $IFACE_MAC ]]; then
   echo "Error: cannot find the MAC address for for VM network ${IFACE_SOURCE}"
   exit 2
 fi
-GUEST_IFACE=$("$VAGRANT_CMD" ssh "$NODE_NAME" -- ip -o link | awk -F': ' "/${IFACE_MAC}/ {print \$2}")
+GUEST_IFACE=$("$VAGRANT_CMD" ssh "$NODE_NAME" -- ip -o link | grep "${IFACE_MAC}" | cut -d: -f2 | tr -d ' ')
 if [[ -z $GUEST_IFACE ]]; then
-  GUEST_IFACE=$("$VAGRANT_CMD" ssh "$NODE_NAME" -- ip link | grep -B1 "$IFACE_MAC" | head -1 | awk -F: '{print $2}' | tr -d ' ')
+  GUEST_IFACE=$("$VAGRANT_CMD" ssh "$NODE_NAME" -- ip link | grep -B1 "$IFACE_MAC" | head -1 | cut -d: -f2 | tr -d ' ')
 fi
 if [[ -z $GUEST_IFACE ]]; then
   echo "Error: cannot find the network interface for VM network ${IFACE_SOURCE} on node ${NODE_NAME}"
   exit 2
 fi
 
-GUEST_IFACE_STATUS=$("$VAGRANT_CMD" ssh "$NODE_NAME" -- ip link show "$GUEST_IFACE" | grep -o "state [A-Z]*" | awk '{print $2}')
+GUEST_IFACE_STATUS=$("$VAGRANT_CMD" ssh "$NODE_NAME" -- ip link show "$GUEST_IFACE" | grep -o "state [A-Z]*" | cut -d' ' -f2)
 
 case "$SUBCMD" in
   detach)

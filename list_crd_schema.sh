@@ -49,17 +49,17 @@ printf "%-40s | %-20s\n" "Property Path" "Type"
 echo "-------------------------------------------------------"
 
 # Process spec and status
-jq -r ".spec.versions[] | select(.name == \"$VERSION\") | .schema.openAPIV3Schema" <<< "$CRD_JSON" | 
+jq -r ".spec.versions[] | select(.name == \"$VERSION\") | .schema.openAPIV3Schema" <<< "$CRD_JSON" |
 {
     # Process spec
     echo "[Spec Fields]"
     process_schema "spec" | grep '^spec\.' |
-    awk -F'\t' '{printf "%-40s | %-20s\n", $1, $2}'
+    while IFS=$'\t' read -r col1 col2; do printf "%-40s | %-20s\n" "$col1" "$col2"; done
 }
-jq -r ".spec.versions[] | select(.name == \"$VERSION\") | .schema.openAPIV3Schema" <<< "$CRD_JSON" | 
+jq -r ".spec.versions[] | select(.name == \"$VERSION\") | .schema.openAPIV3Schema" <<< "$CRD_JSON" |
 {
     # Process status
     echo "[Status Fields]"
     process_schema "status" | grep '^status\.' |
-    awk -F'\t' '{printf "%-40s | %-20s\n", $1, $2}'
+    while IFS=$'\t' read -r col1 col2; do printf "%-40s | %-20s\n" "$col1" "$col2"; done
 }
