@@ -85,12 +85,13 @@ require 'yaml'
 # - https://medium.com/@dharsannanantharaman/create-a-high-availabilty-lightweight-kubernetes-k3s-cluster-using-vagrant-822a1e025855
 # - https://github.com/justmeandopensource/kubernetes/tree/master/vagrant-provisioning
 
-box_image = "bento/ubuntu-24.04"
+box_image = "cloud-image/ubuntu-26.04"
+#box_image = "bento/ubuntu-24.04"
 #box_image = "generic/ubuntu2004"
 
 #k3s_version = "latest"
-#k3s_version = "v1.34.2+k3s1"  # incompatible with longhorn-manager master-head (client-go v0.35 WatchListClient issue)
-k3s_version = "v1.33.1+k3s1"
+k3s_version = "v1.34.2+k3s1"
+#k3s_version = "v1.33.1+k3s1"
 #k3s_version = "v1.33.10+k3s1"
 #k3s_version = "v1.23.17+k3s1"
 #k3s_version = "v1.13.4+k3s1"
@@ -102,6 +103,7 @@ k3s_bin_url = k3s_version == "latest" \
 
 #longhorn_version = ''
 longhorn_version = 'master'
+#longhorn_version = 'v1.11.x'
 #longhorn_version = 'v1.11.0'
 #longhorn_version = 'v1.10.2'
 #longhorn_version = 'v1.9.2'
@@ -114,10 +116,8 @@ longhorn_version = 'master'
 #longhorn_version = 'v1.2.6'
 
 longhorn_cli_version = longhorn_version
-longhorn_cli_image_version = longhorn_version
 if longhorn_version == 'master' || longhorn_version == ''
   longhorn_cli_version = 'v1.10.0'
-  longhorn_cli_image_version = 'master-head'
 end
 
 libvirt_network_name = "vagrant-longhorn"
@@ -140,9 +140,9 @@ libvirt_network_subnet_ipv6 = "fd00:dead:beef"
 #             API server binds to IPv4; --node-ip carries both families.
 #             pod.Status.podIP will be IPv6 (primary family from first CIDR).
 #             Used to test data-engine-ip-family=ipv4 on an IPv6-first cluster.
-network_stack = "ipv6"
+#network_stack = "ipv6"
 #network_stack = "ipv4"
-#network_stack = "dual"
+network_stack = "dual"
 #network_stack = "dual6"
 
 # Backup target selection. Requires `vagrant destroy -f && vagrant up` to apply.
@@ -198,9 +198,12 @@ k3s_token = "libvirt-ubuntu-token"
 # block disk is needed by Longhorn engine V2
 enable_longhorn_v2_engine = "true"
 #enable_longhorn_v2_engine = "false"
-longhorn_default_fs_disk_device = "/dev/vdc"
+k3s_data_disk_device = "/dev/vdb"
+k3s_data_disk_path = "/var/lib/rancher"
+system_log_disk_device = "/dev/vdc"
+longhorn_default_fs_disk_device = "/dev/vdd"
 longhorn_default_fs_disk_path = "/var/lib/longhorn/"
-longhorn_default_blk_disk_device = "/dev/vdb"
+longhorn_default_blk_disk_device = "/dev/vde"
 longhorn_worker_node_default_disk_config = [
   {
     "path" => longhorn_default_fs_disk_path,
@@ -291,17 +294,24 @@ provision_all_node_script = <<~SHELL
 
     echo "Provision node role $NODE_ROLE"
 
-    echo 'System disk ...'
-    if [ "$ROLE" == "master" ]; then
-      SYSTEM_LOG_DISK_DEVICE="/dev/vdb"
-    else
-      SYSTEM_LOG_DISK_DEVICE="/dev/vdd"
+    echo 'System data disk ...'
+    mkfs.ext4 #{k3s_data_disk_device}
+    mkdir -p /mnt/temp_rancher #{k3s_data_disk_path}
+    mount #{k3s_data_disk_device} /mnt/temp_rancher
+    rsync -aHAX #{k3s_data_disk_path}/ /mnt/temp_rancher/
+    UUID=$(blkid -s UUID -o value #{k3s_data_disk_device})
+    if ! grep -q "$UUID" /etc/fstab; then
+      echo "UUID=$UUID #{k3s_data_disk_path} ext4 defaults 0 2" >> /etc/fstab
     fi
-    mkfs.ext4 "$SYSTEM_LOG_DISK_DEVICE"
+    umount /mnt/temp_rancher && rm -r /mnt/temp_rancher
+    mount -a
+
+    echo 'System log disk ...'
+    mkfs.ext4 #{system_log_disk_device}
     mkdir -p /mnt/temp_log
-    mount "$SYSTEM_LOG_DISK_DEVICE" /mnt/temp_log
+    mount #{system_log_disk_device} /mnt/temp_log
     rsync -aHAX /var/log/ /mnt/temp_log/
-    UUID=$(blkid -s UUID -o value "$SYSTEM_LOG_DISK_DEVICE")
+    UUID=$(blkid -s UUID -o value #{system_log_disk_device})
     if ! grep -q "$UUID" /etc/fstab; then
       echo "UUID=$UUID /var/log ext4 defaults 0 2" >> /etc/fstab
     fi
@@ -325,9 +335,37 @@ provision_all_node_script = <<~SHELL
     fi
     df -h
 
+    echo 'Install Longhorn dependencies ...'
+    apt-get update
+    LONGHORN_PACKAGES="nfs-common open-iscsi cryptsetup jq"
+    KERNEL_EXTRA_PACKAGE="linux-modules-extra-$(uname -r)"
+    if apt-cache show "${KERNEL_EXTRA_PACKAGE}" >/dev/null 2>&1; then
+      LONGHORN_PACKAGES="${LONGHORN_PACKAGES} ${KERNEL_EXTRA_PACKAGE}"
+    fi
+    apt-get install -y ${LONGHORN_PACKAGES}
+    systemctl enable --now iscsid
+
+    cat >/etc/modules-load.d/longhorn.conf <<MODULES
+    nfs
+    dm_crypt
+    nvme_tcp
+    uio_pci_generic
+    vfio_pci
+    MODULES
+    while read -r module; do
+      modprobe "${module}"
+    done </etc/modules-load.d/longhorn.conf
+    if modprobe --dry-run ublk_drv >/dev/null 2>&1; then
+      modprobe ublk_drv
+      echo ublk_drv >>/etc/modules-load.d/longhorn.conf
+    fi
+
+    # The V2 engine always uses SPDK, but this resource-constrained cluster
+    # runs it in interrupt mode without reserving hugepages.
+    echo 'vm.nr_hugepages = 0' >/etc/sysctl.d/99-longhorn.conf
+    sysctl -w vm.nr_hugepages=0
+
     echo 'System configurations'
-    #sysctl -w vm.nr_hugepages=1024
-    #echo 'vm.nr_hugepages = 1024' >>/etc/sysctl.conf
     cat >/etc/logrotate.d/rsyslog <<LOGROTATE_CONFIG
     /var/log/syslog
     {
@@ -369,7 +407,6 @@ provision_all_node_script = <<~SHELL
     systemctl disable multipath-tools.service multipathd.socket
 
     echo 'Install other CLI tools ...'
-    apt-get install -y jq
     curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
     chmod +x kubectl && mv kubectl /usr/local/bin/
     #systemctl restart snapd.seeded.service
@@ -382,12 +419,31 @@ provision_all_node_script = <<~SHELL
     chmod +x ./longhornctl
     mv ./longhornctl /usr/bin/
 
-    # IPv6: Assign static ULA address to the storage interface (eth1).
+    # IPv6: Assign static ULA address to the storage interface.
     # We write a netplan fragment so the address survives reboots.
     # The file only declares the IPv6 address; Vagrant manages the IPv4 side.
     # NOTE: printf is used instead of a heredoc to avoid a zero-indented
     # closing delimiter (e.g. NETPLAN) that would cause Ruby <<~SHELL to
     # strip 0 chars from all lines, breaking the LOGROTATE_CONFIG heredoc.
+
+    # Detect the actual private network interface name (eth1 on Ubuntu 24.04, ens7 on Ubuntu 26.04)
+    # The storage network is always the second non-loopback interface.
+    # IMPORTANT: Use the primary interface name, not altnames, as K3s won't recognize altnames.
+    # We can't rely on IP address detection because the IP isn't assigned yet at this point.
+
+    # Get the second non-loopback interface by listing all interfaces and taking the 3rd one
+    # (lo is #1, first eth/ens is #2, second eth/ens is #3 - our storage network)
+    STORAGE_IFACE=$(ip -o link show | head -n 3 | tail -n 1 | cut -d: -f2 | tr -d ' ')
+
+    if [[ -z "${STORAGE_IFACE}" ]]; then
+      echo "WARNING: Could not detect storage interface, trying fallback eth1"
+      STORAGE_IFACE="eth1"
+    else
+      echo "Detected storage interface: ${STORAGE_IFACE}"
+    fi
+
+    # Export for K3s configuration in subsequent provisioning steps
+    echo "export STORAGE_IFACE=${STORAGE_IFACE}" >> /etc/environment
 
     # Fix permissions on all netplan files to avoid warnings during netplan generate/apply.
     # Netplan requires 0600 or 0640 permissions; Vagrant base boxes may create files with 0644.
@@ -395,13 +451,13 @@ provision_all_node_script = <<~SHELL
     chmod 600 /etc/netplan/*.yaml 2>/dev/null || true
 
     if [[ -n "${NODE_IPV6}" ]]; then
-      echo "IPv6: assigning ${NODE_IPV6}/64 to eth1"
-      printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses:\n        - "%s/64"\n' \
-        "${NODE_IPV6}" >/etc/netplan/60-eth1-ipv6.yaml
-      chmod 600 /etc/netplan/60-eth1-ipv6.yaml
+      echo "IPv6: assigning ${NODE_IPV6}/64 to ${STORAGE_IFACE}"
+      printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      addresses:\n        - "%s/64"\n' \
+        "${STORAGE_IFACE}" "${NODE_IPV6}" >/etc/netplan/60-storage-ipv6.yaml
+      chmod 600 /etc/netplan/60-storage-ipv6.yaml
       netplan apply
-      echo "IPv6: current eth1 addresses:"
-      ip -6 addr show eth1
+      echo "IPv6: current ${STORAGE_IFACE} addresses:"
+      ip -6 addr show "${STORAGE_IFACE}"
     fi
 
     if [ "${ROLE}" != "master" ]; then
@@ -412,9 +468,6 @@ provision_all_node_script = <<~SHELL
       echo 'Skipping Longhorn data disk preparation on master'
     fi
 
-    # kernel modules for SPDK
-    modprobe nvme_tcp
-    echo nvme_tcp | sudo tee /etc/modules-load.d/nvme_tcp.conf
     SHELL
 
 provision_master_script = <<~SHELL
@@ -436,6 +489,11 @@ provision_master_script = <<~SHELL
 
     echo 'Install K3s ...'
 
+    # Load the detected storage interface name from environment
+    source /etc/environment
+    FLANNEL_IFACE="${STORAGE_IFACE:-eth1}"
+    echo "Using flannel interface: ${FLANNEL_IFACE}"
+
     INSTALL_K3S_ARGS=(
     -v 9
     --token "#{k3s_token}"
@@ -452,7 +510,7 @@ provision_master_script = <<~SHELL
     --node-external-ip=#{master_node_ip}
     --node-taint='node-role.kubernetes.io/control-plane:NoSchedule'
     --node-taint='node-role.kubernetes.io/master=true:NoExecute'
-    --flannel-iface eth1
+    --flannel-iface "${FLANNEL_IFACE}"
     #--disable-helm-controller
     --cluster-cidr=#{k3s_cluster_cidr}
     --service-cidr=#{k3s_service_cidr}
@@ -539,9 +597,6 @@ provision_master_script = <<~SHELL
 
     echo "Skipping Longhorn default disk config on master ${NODE_NAME}"
 
-    #echo "Install Longhorn prerequisite dependencies ..."
-    #longhornctl --image longhornio/longhorn-cli:#{longhorn_cli_image_version} install preflight --enable-spdk
-
     if [[ -n "#{longhorn_version}" ]]; then
       echo "Install Longhorn #{longhorn_version} on ${NODE_NAME} ..."
       kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/#{longhorn_version}/deploy/longhorn.yaml
@@ -600,12 +655,17 @@ provision_master_script = <<~SHELL
 provision_worker_script = <<~SHELL
     echo 'Install K3s ...'
 
+    # Load the detected storage interface name from environment
+    source /etc/environment
+    FLANNEL_IFACE="${STORAGE_IFACE:-eth1}"
+    echo "Using flannel interface: ${FLANNEL_IFACE}"
+
     INSTALL_K3S_ARGS=(
     --token "#{k3s_token}"
     --kubelet-arg=node-status-update-frequency=5s
     --kubelet-arg=hairpin-mode=promiscuous-bridge
     --server #{master_server_url}
-    --flannel-iface eth1
+    --flannel-iface "${FLANNEL_IFACE}"
     )
 
     # Download the k3s binary directly (air-gap method) to probe for flag support
@@ -656,23 +716,24 @@ Vagrant.configure("2") do |config|
     provider.memorybacking :access, :mode => "shared" # needed by virtio-fs share folder
   end
 
+  config.trigger.after [:up, :resume] do |trigger|
+    trigger.name = "Resynchronize guest clock"
+    trigger.info = "Resetting Chrony state after VM startup or resume"
+    trigger.run_remote = {
+      privileged: true,
+      inline: <<~SHELL
+        systemctl restart chrony
+        chronyc waitsync 30 0.1
+      SHELL
+    }
+  end
+
   config.trigger.after :status do |trigger|
     trigger.ruby do | env, machine |
       puts "Kubernetes KUBECONFIG: #{shared_path(env, kubeconfig_file)}"
     end
   end
 
-  #config.trigger.after :up do |trigger|
-  #  trigger.name = "Longhorn prerequisite installation"
-  #  trigger.run_remote = {
-  #    inline: <<~SHELL
-  #    export KUBECONFIG=~vagrant/.kube/config
-  #    longhornctl --image longhornio/longhorn-cli:#{longhorn_cli_image_version} install preflight --enable-spdk
-  #    sysctl -w vm.nr_hugepages=0
-  #    echo 'vm.nr_hugepages = 0' >>/etc/sysctl.conf
-  #    SHELL
-  #  }
-  #end
 
   config.vm.define master_host, primary: true do |master|
     master.trigger.before :up do |trigger|
@@ -731,15 +792,21 @@ Vagrant.configure("2") do |config|
       provider.cpu_mode = 'host-passthrough'
       provider.disk_driver :cache => 'unsafe'
       provider.storage :file, {
-        size: '100G',
+        size: '50G',
         device: 'vdb',
+        path: "k3s-data-#{master_host}.qcow2",
       }
+        provider.storage :file, {
+          size: '50G',
+          device: 'vdc',
+          path: "log-#{master_host}.qcow2",
+        }
       #provider.management_network_keep = true
     end
     master.vm.provision "master_node_setup",
       type: "shell",
       inline: provision_all_node_script,
-      env: { NODE_NAME: master_host, NODE_ROLE: "master",
+      env: { NODE_IP: master_ip, NODE_NAME: master_host, NODE_ROLE: "master",
              NODE_IPV6: (network_stack == "ipv6" || network_stack == "dual" || network_stack == "dual6") ? master_ipv6 : "" }
     master.vm.provision "master",
       type: "shell",
@@ -772,17 +839,23 @@ Vagrant.configure("2") do |config|
         provider.cpu_mode = 'host-passthrough'
         provider.disk_driver :cache => 'unsafe'
         provider.storage :file, {
-          size: '100G',
-          device: 'vdd',
+          size: '50G',
+          device: 'vdb',
+          path: "k3s-data-#{worker_name}.qcow2",
+        }
+        provider.storage :file, {
+          size: '50G',
+          device: 'vdc',
+          path: "log-#{worker_name}.qcow2",
         }
         provider.storage :file, {
           size: '200G',
-          device: 'vdc',
+          device: 'vdd',
           path: "extend1-#{worker_name}.qcow2",
         }
         provider.storage :file, {
           size: '200G',
-          device: 'vdb',
+          device: 'vde',
           path: "extend2-#{worker_name}.qcow2",
         }
         #provider.management_network_keep = true
