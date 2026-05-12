@@ -388,6 +388,12 @@ provision_all_node_script = <<~SHELL
     # NOTE: printf is used instead of a heredoc to avoid a zero-indented
     # closing delimiter (e.g. NETPLAN) that would cause Ruby <<~SHELL to
     # strip 0 chars from all lines, breaking the LOGROTATE_CONFIG heredoc.
+
+    # Fix permissions on all netplan files to avoid warnings during netplan generate/apply.
+    # Netplan requires 0600 or 0640 permissions; Vagrant base boxes may create files with 0644.
+    echo "Fixing netplan file permissions ..."
+    chmod 600 /etc/netplan/*.yaml 2>/dev/null || true
+
     if [[ -n "${NODE_IPV6}" ]]; then
       echo "IPv6: assigning ${NODE_IPV6}/64 to eth1"
       printf 'network:\n  version: 2\n  ethernets:\n    eth1:\n      addresses:\n        - "%s/64"\n' \
