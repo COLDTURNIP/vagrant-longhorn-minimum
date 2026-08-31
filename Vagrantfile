@@ -145,6 +145,20 @@ libvirt_network_subnet_ipv6 = "fd00:dead:beef"
 network_stack = "dual"
 #network_stack = "dual6"
 
+# Multus uses a stable name for the second VM NIC. The guest provisioner
+# renames the box/provider-specific interface and persists the name with netplan.
+multus_parent_interface = "lhstorage0"
+multus_chart_url = "https://raw.githubusercontent.com/rancher/rke2-charts/main/assets/rke2-multus/rke2-multus-v4.2.418.tgz"
+longhorn_storage_network_name = "vagrant-storage-network"
+longhorn_storage_network_ip_ranges = case network_stack
+                                      when "ipv6"
+                                        '[{"range":"fd00:dead:beef::8000/113"}]'
+                                      when "dual", "dual6"
+                                        '[{"range":"192.168.156.128/25"},{"range":"fd00:dead:beef::8000/113"}]'
+                                      else
+                                        '[{"range":"192.168.156.128/25"}]'
+                                      end
+
 # Backup target selection. Requires `vagrant destroy -f && vagrant up` to apply.
 #   "minio" - S3-compatible object storage (default)
 #   "nfs"   - NFS server (use to reproduce NFS-specific issues such as longhorn/longhorn#12896)
@@ -245,6 +259,7 @@ longhorn_default_settings = {
   "deleting-confirmation-flag"                   => %q("true"),
   "storage-reserved-percentage-for-default-disk" => %q("0"),
   "allow-collecting-longhorn-usage-metrics"      => %q("false"),
+  "storage-network"                               => %Q("#{longhorn_storage_network_name.empty? ? "" : "longhorn-system/#{longhorn_storage_network_name}"}"),
   "backup-target"                                => backup_target == "nfs" \
     ? %q("nfs://longhorn-test-nfs-svc.default:/opt/backupstore") \
     : %q("s3://backupbucket@us-east-1/"),
@@ -419,46 +434,40 @@ provision_all_node_script = <<~SHELL
     chmod +x ./longhornctl
     mv ./longhornctl /usr/bin/
 
-    # IPv6: Assign static ULA address to the storage interface.
-    # We write a netplan fragment so the address survives reboots.
-    # The file only declares the IPv6 address; Vagrant manages the IPv4 side.
-    # NOTE: printf is used instead of a heredoc to avoid a zero-indented
-    # closing delimiter (e.g. NETPLAN) that would cause Ruby <<~SHELL to
-    # strip 0 chars from all lines, breaking the LOGROTATE_CONFIG heredoc.
-
-    # Detect the actual private network interface name (eth1 on Ubuntu 24.04, ens7 on Ubuntu 26.04)
-    # The storage network is always the second non-loopback interface.
-    # IMPORTANT: Use the primary interface name, not altnames, as K3s won't recognize altnames.
-    # We can't rely on IP address detection because the IP isn't assigned yet at this point.
-
-    # Get the second non-loopback interface by listing all interfaces and taking the 3rd one
-    # (lo is #1, first eth/ens is #2, second eth/ens is #3 - our storage network)
+    # Normalize the second VM NIC to a stable name. Master and worker PCI layouts
+    # assign different predictable names, but one NAD must name the same parent
+    # interface on every node.
     STORAGE_IFACE=$(ip -o link show | head -n 3 | tail -n 1 | cut -d: -f2 | tr -d ' ')
-
     if [[ -z "${STORAGE_IFACE}" ]]; then
-      echo "WARNING: Could not detect storage interface, trying fallback eth1"
-      STORAGE_IFACE="eth1"
-    else
-      echo "Detected storage interface: ${STORAGE_IFACE}"
+      echo 'ERROR: Could not detect the second non-loopback interface'
+      exit 1
     fi
+    echo "Detected storage interface: ${STORAGE_IFACE}"
 
-    # Export for K3s configuration in subsequent provisioning steps
-    echo "export STORAGE_IFACE=${STORAGE_IFACE}" >> /etc/environment
-
-    # Fix permissions on all netplan files to avoid warnings during netplan generate/apply.
-    # Netplan requires 0600 or 0640 permissions; Vagrant base boxes may create files with 0644.
-    echo "Fixing netplan file permissions ..."
-    chmod 600 /etc/netplan/*.yaml 2>/dev/null || true
+    STORAGE_MAC=$(cat "/sys/class/net/${STORAGE_IFACE}/address")
+    if [[ "${STORAGE_IFACE}" != "#{multus_parent_interface}" ]]; then
+      ip link set "${STORAGE_IFACE}" down
+      ip link set "${STORAGE_IFACE}" name "#{multus_parent_interface}"
+      ip link set "#{multus_parent_interface}" up
+      STORAGE_IFACE="#{multus_parent_interface}"
+    fi
 
     if [[ -n "${NODE_IPV6}" ]]; then
-      echo "IPv6: assigning ${NODE_IPV6}/64 to ${STORAGE_IFACE}"
-      printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      addresses:\n        - "%s/64"\n' \
-        "${STORAGE_IFACE}" "${NODE_IPV6}" >/etc/netplan/60-storage-ipv6.yaml
-      chmod 600 /etc/netplan/60-storage-ipv6.yaml
-      netplan apply
-      echo "IPv6: current ${STORAGE_IFACE} addresses:"
-      ip -6 addr show "${STORAGE_IFACE}"
+      printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      match:\n        macaddress: "%s"\n      set-name: "%s"\n      addresses:\n        - "%s/24"\n        - "%s/64"\n' \
+        "${STORAGE_IFACE}" "${STORAGE_MAC}" "${STORAGE_IFACE}" "${NODE_IP}" "${NODE_IPV6}" \
+        >/etc/netplan/60-longhorn-storage-network.yaml
+    else
+      printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      match:\n        macaddress: "%s"\n      set-name: "%s"\n      addresses:\n        - "%s/24"\n' \
+        "${STORAGE_IFACE}" "${STORAGE_MAC}" "${STORAGE_IFACE}" "${NODE_IP}" \
+        >/etc/netplan/60-longhorn-storage-network.yaml
     fi
+    rm -f /etc/netplan/60-storage-ipv6.yaml
+    chmod 600 /etc/netplan/*.yaml
+    netplan apply
+
+    echo "Storage interface ${STORAGE_IFACE}:"
+    ip addr show "${STORAGE_IFACE}"
+    echo "export STORAGE_IFACE=${STORAGE_IFACE}" >> /etc/environment
 
     if [ "${ROLE}" != "master" ]; then
       echo 'Prepare disks for Longhorn ...'
@@ -538,12 +547,19 @@ provision_master_script = <<~SHELL
 
     echo 'Post initialiing K3s ...'
     K8S_READY_TIMEOUT=$(( $(date +%s) + 300 ))
-    while [ "$(date +%s)" -lt "$K8S_READY_TIMEOUT" ] &&
-      ! kubectl -n kube-system get deployment coredns 2>/dev/null &&
-      kubectl get node "$NODE_NAME" 2>/dev/null; do
+    until kubectl get node "$NODE_NAME" >/dev/null 2>&1 &&
+          kubectl -n kube-system get deployment coredns >/dev/null 2>&1; do
+      if [ "$(date +%s)" -ge "$K8S_READY_TIMEOUT" ]; then
+        echo 'ERROR: K3s node or CoreDNS deployment did not become available'
+        exit 1
+      fi
       sleep 1
     done
     kubectl label node "$NODE_NAME" node-role.kubernetes.io/master=true --overwrite
+    # Bootstrap Helm jobs do not tolerate the permanent control-plane taints.
+    # Remove them until Multus and its NetworkAttachmentDefinition CRD exist.
+    kubectl taint node "$NODE_NAME" node-role.kubernetes.io/control-plane:NoSchedule- || true
+    kubectl taint node "$NODE_NAME" node-role.kubernetes.io/master:NoExecute- || true
     kubectl -n kube-system patch deployment coredns \
       --type='merge' \
       -p '
@@ -570,6 +586,66 @@ provision_master_script = <<~SHELL
         }
       }
     }'
+
+    echo 'Install Multus and Whereabouts ...'
+    kubectl apply -f - <<YAML
+    apiVersion: helm.cattle.io/v1
+    kind: HelmChart
+    metadata:
+      name: multus
+      namespace: kube-system
+    spec:
+      chart: #{multus_chart_url}
+      targetNamespace: kube-system
+      valuesContent: |-
+        config:
+          fullnameOverride: multus
+          cni_conf:
+            confDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+            binDir: /var/lib/rancher/k3s/data/cni/
+            kubeconfig: /var/lib/rancher/k3s/agent/etc/cni/net.d/multus.d/multus.kubeconfig
+            multusAutoconfigDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+        rke2-whereabouts:
+          fullnameOverride: whereabouts
+          enabled: true
+          cniConf:
+            confDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+            binDir: /var/lib/rancher/k3s/data/cni/
+    YAML
+
+    MULTUS_READY_TIMEOUT=$(( $(date +%s) + 300 ))
+    until kubectl get customresourcedefinition network-attachment-definitions.k8s.cni.cncf.io >/dev/null 2>&1; do
+      if [ "$(date +%s)" -ge "$MULTUS_READY_TIMEOUT" ]; then
+        echo 'ERROR: Multus NetworkAttachmentDefinition CRD was not installed'
+        exit 1
+      fi
+      sleep 2
+    done
+
+    kubectl create namespace longhorn-system 2>/dev/null || true
+    kubectl apply -f - <<YAML
+    apiVersion: k8s.cni.cncf.io/v1
+    kind: NetworkAttachmentDefinition
+    metadata:
+      name: #{longhorn_storage_network_name}
+      namespace: longhorn-system
+    spec:
+      config: |-
+        {
+          "cniVersion": "1.0.0",
+          "type": "macvlan",
+          "master": "#{multus_parent_interface}",
+          "mode": "bridge",
+          "ipam": {
+            "type": "whereabouts",
+            "ipRanges": #{longhorn_storage_network_ip_ranges},
+            "configuration_path": "/var/lib/rancher/k3s/agent/etc/cni/net.d/whereabouts.d/whereabouts.conf"
+          }
+        }
+    YAML
+
+    kubectl taint node "$NODE_NAME" node-role.kubernetes.io/control-plane=:NoSchedule --overwrite
+    kubectl taint node "$NODE_NAME" node-role.kubernetes.io/master=:NoExecute --overwrite
 
     echo 'Install CSI snapshot support ...'
     kubectl kustomize https://github.com/kubernetes-csi/external-snapshotter/client/config/crd | kubectl create -f -
@@ -601,7 +677,6 @@ provision_master_script = <<~SHELL
       echo "Install Longhorn #{longhorn_version} on ${NODE_NAME} ..."
       kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/#{longhorn_version}/deploy/longhorn.yaml
       echo 'Longhorn #{longhorn_version} installed. It would take several minutes for pods get ready.'
-
       echo "Setup Longhorn customized default configurations ..."
       kubectl create namespace longhorn-system 2>/dev/null || true
       kubectl apply -f - <<YAML
@@ -635,6 +710,18 @@ provision_master_script = <<~SHELL
     #{longhorn_configmap_resource_lines}
     YAML
 
+      LONGHORN_SETTING_TIMEOUT=$(( $(date +%s) + 600 ))
+      until kubectl -n longhorn-system get setting.longhorn.io storage-network >/dev/null 2>&1; do
+        if [ "$(date +%s)" -ge "$LONGHORN_SETTING_TIMEOUT" ]; then
+          echo 'ERROR: Longhorn storage-network setting was not created'
+          exit 1
+        fi
+        sleep 5
+      done
+      kubectl -n longhorn-system patch setting.longhorn.io storage-network \
+        --type=merge \
+        -p '{"value":"longhorn-system/#{longhorn_storage_network_name}"}'
+
     fi
 
     if [[ "#{backup_target}" == "nfs" ]]; then
@@ -665,6 +752,7 @@ provision_worker_script = <<~SHELL
     --kubelet-arg=node-status-update-frequency=5s
     --kubelet-arg=hairpin-mode=promiscuous-bridge
     --server #{master_server_url}
+    --node-taint=longhorn.io/multus-not-ready=true:NoSchedule
     --flannel-iface "${FLANNEL_IFACE}"
     )
 
@@ -695,6 +783,18 @@ provision_worker_script = <<~SHELL
     cp /vagrant_shared/#{kubeconfig_file} ~vagrant/.kube/config || ls -l /vagrant_shared/
     chown vagrant:vagrant ~vagrant/.kube/config
     export KUBECONFIG=~vagrant/.kube/config
+
+    MULTUS_READY_TIMEOUT=$(( $(date +%s) + 300 ))
+    while [ ! -x /var/lib/rancher/k3s/data/cni/multus ] ||
+          [ ! -x /var/lib/rancher/k3s/data/cni/whereabouts ] ||
+          [ ! -f /var/lib/rancher/k3s/agent/etc/cni/net.d/00-multus.conflist ]; do
+      if [ "$(date +%s)" -ge "$MULTUS_READY_TIMEOUT" ]; then
+        echo "ERROR: Multus did not become ready on ${NODE_NAME}"
+        exit 1
+      fi
+      sleep 2
+    done
+    kubectl taint node "$NODE_NAME" longhorn.io/multus-not-ready-
 
     echo "Waiting for node ${NODE_NAME} joining the Kubernetes cluster ..."
     kubectl wait --for=condition=Ready node/${NODE_NAME} --timeout=600s
