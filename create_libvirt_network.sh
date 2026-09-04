@@ -41,6 +41,7 @@ case "$NETWORK_STACK" in
 <network>
   <name>${NETWORK_NAME}</name>
   <bridge name="${NETWORK_INTERFACE}" zone="trusted" stp="on" delay="0"/>
+  <portgroup name="longhorn-storage" default="yes"/>
   <forward mode="nat"/>
   <ip address="${SUBNET_IPV4}.1" netmask="255.255.255.0"/>
 </network>
@@ -51,6 +52,7 @@ EOF
 <network>
   <name>${NETWORK_NAME}</name>
   <bridge name="${NETWORK_INTERFACE}" zone="trusted" stp="on" delay="0"/>
+  <portgroup name="longhorn-storage" default="yes"/>
   <forward mode="nat"/>
   <ip family="ipv6" address="${SUBNET_IPV6}::1" prefix="64"/>
 </network>
@@ -61,6 +63,7 @@ EOF
 <network>
   <name>${NETWORK_NAME}</name>
   <bridge name="${NETWORK_INTERFACE}" zone="trusted" stp="on" delay="0"/>
+  <portgroup name="longhorn-storage" default="yes"/>
   <forward mode="nat"/>
   <ip address="${SUBNET_IPV4}.1" netmask="255.255.255.0"/>
   <ip family="ipv6" address="${SUBNET_IPV6}::1" prefix="64"/>
@@ -68,6 +71,18 @@ EOF
 EOF
     ;;
 esac
+
+if virsh net-info "${NETWORK_NAME}" >/dev/null 2>&1 &&
+   ! virsh net-dumpxml "${NETWORK_NAME}" | grep -q '<portgroup name=.longhorn-storage.'; then
+  CONNECTIONS=$(virsh net-info "${NETWORK_NAME}" | awk '/^Connections:/ { print $2 }')
+  if [[ "${CONNECTIONS}" != "0" ]]; then
+    echo "error: network ${NETWORK_NAME} needs the longhorn-storage port group but has ${CONNECTIONS} active connections"
+    echo "destroy the existing Vagrant machines before recreating the network"
+    exit 1
+  fi
+  virsh net-destroy "${NETWORK_NAME}" >/dev/null 2>&1 || true
+  virsh net-undefine "${NETWORK_NAME}"
+fi
 
 if ! virsh net-info "${NETWORK_NAME}" >/dev/null 2>&1; then
   virsh net-define "${NETWORK_DEFINE_FILE}"

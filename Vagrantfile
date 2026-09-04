@@ -152,12 +152,15 @@ multus_chart_url = "https://raw.githubusercontent.com/rancher/rke2-charts/main/a
 longhorn_storage_network_name = "vagrant-storage-network"
 longhorn_storage_network_ip_ranges = case network_stack
                                       when "ipv6"
-                                        '[{"range":"fd00:dead:beef::8000/113"}]'
+                                        '[{"range":"fd00:dead:beef::8000/113","range_start":"fd00:dead:beef::8010"}]'
                                       when "dual", "dual6"
-                                        '[{"range":"192.168.156.128/25"},{"range":"fd00:dead:beef::8000/113"}]'
+                                        '[{"range":"192.168.156.128/25","range_start":"192.168.156.140"},{"range":"fd00:dead:beef::8000/113","range_start":"fd00:dead:beef::8010"}]'
                                       else
-                                        '[{"range":"192.168.156.128/25"}]'
+                                        '[{"range":"192.168.156.128/25","range_start":"192.168.156.140"}]'
                                       end
+longhorn_storage_network_ipv4_cidr = network_stack == "ipv6" ? "" : "192.168.156.128/25"
+longhorn_storage_network_ipv6_cidr = ["ipv6", "dual", "dual6"].include?(network_stack) ? "fd00:dead:beef::8000/113" : ""
+
 
 # Backup target selection. Requires `vagrant destroy -f && vagrant up` to apply.
 #   "minio" - S3-compatible object storage (default)
@@ -168,13 +171,15 @@ backup_target = "minio"
 master_host = "libvirt-ubuntu-k3s-master"
 master_ip   = "#{libvirt_network_subnet_ipv4}.20"
 master_ipv6 = "#{libvirt_network_subnet_ipv6}::20"  # IPv6: master storage IPv6
+master_storage_ipv4 = "192.168.156.130"
+master_storage_ipv6 = "fd00:dead:beef::8002"
 master_cpu  = "2"
 master_memory = "3072"
 
 workers = {
-  "libvirt-ubuntu-k3s-worker1" => { ip: "#{libvirt_network_subnet_ipv4}.21", ipv6: "#{libvirt_network_subnet_ipv6}::21" },
-  "libvirt-ubuntu-k3s-worker2" => { ip: "#{libvirt_network_subnet_ipv4}.22", ipv6: "#{libvirt_network_subnet_ipv6}::22" },
-  "libvirt-ubuntu-k3s-worker3" => { ip: "#{libvirt_network_subnet_ipv4}.23", ipv6: "#{libvirt_network_subnet_ipv6}::23" },
+  "libvirt-ubuntu-k3s-worker1" => { ip: "#{libvirt_network_subnet_ipv4}.21", ipv6: "#{libvirt_network_subnet_ipv6}::21", storage_ipv4: "192.168.156.131", storage_ipv6: "fd00:dead:beef::8003" },
+  "libvirt-ubuntu-k3s-worker2" => { ip: "#{libvirt_network_subnet_ipv4}.22", ipv6: "#{libvirt_network_subnet_ipv6}::22", storage_ipv4: "192.168.156.132", storage_ipv6: "fd00:dead:beef::8004" },
+  "libvirt-ubuntu-k3s-worker3" => { ip: "#{libvirt_network_subnet_ipv4}.23", ipv6: "#{libvirt_network_subnet_ipv6}::23", storage_ipv4: "192.168.156.133", storage_ipv6: "fd00:dead:beef::8005" },
 }
 
 # K3s addresses and flags derived from network_stack. Do not edit these directly.
@@ -255,7 +260,7 @@ longhorn_default_settings = {
   "create-default-disk-labeled-nodes"            => %q("true"),
   "v2-data-engine"                               => "\"#{enable_longhorn_v2_engine}\"",
   "data-engine-hugepage-enabled"                 => %q('{"v2": "false"}'),
-  "data-engine-interrupt-mode-enabled"           => %q('{"v2": "true"}'),
+  "data-engine-interrupt-mode-enabled"           => %q('{"v2": "false"}'),
   "deleting-confirmation-flag"                   => %q("true"),
   "storage-reserved-percentage-for-default-disk" => %q("0"),
   "allow-collecting-longhorn-usage-metrics"      => %q("false"),
@@ -376,7 +381,7 @@ provision_all_node_script = <<~SHELL
     fi
 
     # The V2 engine always uses SPDK, but this resource-constrained cluster
-    # runs it in interrupt mode without reserving hugepages.
+    # runs it without interrupt mode or reserved hugepages.
     echo 'vm.nr_hugepages = 0' >/etc/sysctl.d/99-longhorn.conf
     sysctl -w vm.nr_hugepages=0
 
@@ -468,6 +473,76 @@ provision_all_node_script = <<~SHELL
     echo "Storage interface ${STORAGE_IFACE}:"
     ip addr show "${STORAGE_IFACE}"
     echo "export STORAGE_IFACE=${STORAGE_IFACE}" >> /etc/environment
+
+    # A macvlan parent cannot communicate directly with its children. Add a
+    # host-side macvlan peer so host-networked V2 NVMe/TCP initiators can reach
+    # both local and remote storage-network endpoints.
+    STORAGE_HOST_IPV4="${STORAGE_HOST_IPV4:--}"
+    STORAGE_HOST_IPV6="${STORAGE_HOST_IPV6:--}"
+    POD_STORAGE_IPV4_CIDR="#{longhorn_storage_network_ipv4_cidr}"
+    POD_STORAGE_IPV6_CIDR="#{longhorn_storage_network_ipv6_cidr}"
+    [[ -n "${POD_STORAGE_IPV4_CIDR}" ]] || POD_STORAGE_IPV4_CIDR="-"
+    [[ -n "${POD_STORAGE_IPV6_CIDR}" ]] || POD_STORAGE_IPV6_CIDR="-"
+
+    cat >/usr/local/sbin/setup-longhorn-storage-host <<'SCRIPT'
+    #!/bin/bash
+    set -euo pipefail
+
+    parent_interface=$1
+    host_ipv4=$2
+    pod_ipv4_cidr=$3
+    host_ipv6=$4
+    pod_ipv6_cidr=$5
+    host_interface=lhstoragehost
+
+    ip link del "${host_interface}" 2>/dev/null || true
+    ip link add "${host_interface}" link "${parent_interface}" type macvlan mode bridge
+
+    if [[ "${pod_ipv4_cidr}" != "-" ]]; then
+      ip address add "${host_ipv4}/32" dev "${host_interface}"
+    fi
+    if [[ "${pod_ipv6_cidr}" != "-" ]]; then
+      ip -6 address add "${host_ipv6}/128" dev "${host_interface}" nodad
+    fi
+
+    ip link set "${host_interface}" up
+
+    if [[ "${pod_ipv4_cidr}" != "-" ]]; then
+      ip route replace "${pod_ipv4_cidr}" dev "${host_interface}" src "${host_ipv4}"
+    fi
+    if [[ "${pod_ipv6_cidr}" != "-" ]]; then
+      ip -6 route replace "${pod_ipv6_cidr}" dev "${host_interface}" src "${host_ipv6}"
+    fi
+    SCRIPT
+    chmod 0755 /usr/local/sbin/setup-longhorn-storage-host
+
+    cat >/etc/systemd/system/longhorn-storage-host.service <<UNIT
+    [Unit]
+    Description=Configure host access to the Longhorn storage network
+    Wants=network-online.target
+    After=network-online.target
+    Before=k3s.service k3s-agent.service
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=/usr/local/sbin/setup-longhorn-storage-host #{multus_parent_interface} ${STORAGE_HOST_IPV4} ${POD_STORAGE_IPV4_CIDR} ${STORAGE_HOST_IPV6} ${POD_STORAGE_IPV6_CIDR}
+
+    [Install]
+    WantedBy=multi-user.target
+    UNIT
+    systemctl daemon-reload
+    systemctl enable longhorn-storage-host.service
+    if ! systemctl restart longhorn-storage-host.service; then
+      systemctl status longhorn-storage-host.service --no-pager
+      exit 1
+    fi
+    systemctl is-active --quiet longhorn-storage-host.service
+
+    echo "Host route to the Longhorn storage network:"
+    [[ "${POD_STORAGE_IPV4_CIDR}" == "-" ]] || ip route show "${POD_STORAGE_IPV4_CIDR}"
+    [[ "${POD_STORAGE_IPV6_CIDR}" == "-" ]] || ip -6 route show "${POD_STORAGE_IPV6_CIDR}"
+
 
     if [ "${ROLE}" != "master" ]; then
       echo 'Prepare disks for Longhorn ...'
@@ -879,11 +954,13 @@ Vagrant.configure("2") do |config|
         end
       end
     end
-    master.vm.network :private_network,
+    master.vm.network :public_network,
       libvirt__network_name: libvirt_network_name,
-      libvirt__dhcp_enabled: false,
-      libvirt__mac: "52:54:00:10:16:01",
-      ip: master_ip
+      libvirt__type: "network",
+      libvirt__portgroup: "longhorn-storage",
+      auto_config: false,
+      libvirt__trust_guest_rx_filters: true,
+      libvirt__mac: "52:54:00:10:16:01"
     master.vm.hostname = master_host
     master.vm.disk :disk, size: "100GB", primary: true
     master.vm.provider :libvirt do |provider|
@@ -907,7 +984,8 @@ Vagrant.configure("2") do |config|
       type: "shell",
       inline: provision_all_node_script,
       env: { NODE_IP: master_ip, NODE_NAME: master_host, NODE_ROLE: "master",
-             NODE_IPV6: (network_stack == "ipv6" || network_stack == "dual" || network_stack == "dual6") ? master_ipv6 : "" }
+             NODE_IPV6: (network_stack == "ipv6" || network_stack == "dual" || network_stack == "dual6") ? master_ipv6 : "",
+             STORAGE_HOST_IPV4: master_storage_ipv4, STORAGE_HOST_IPV6: master_storage_ipv6 }
     master.vm.provision "master",
       type: "shell",
       inline: provision_master_script,
@@ -915,8 +993,10 @@ Vagrant.configure("2") do |config|
   end
 
   workers.each do |worker_name, worker_addrs|
-    worker_ip   = worker_addrs[:ip]
-    worker_ipv6 = worker_addrs[:ipv6]
+    worker_ip           = worker_addrs[:ip]
+    worker_ipv6         = worker_addrs[:ipv6]
+    worker_storage_ipv4 = worker_addrs[:storage_ipv4]
+    worker_storage_ipv6 = worker_addrs[:storage_ipv6]
     config.vm.define worker_name do |worker|
       worker.trigger.before :up do |trigger|
         trigger.name = "Wait master node"
@@ -927,10 +1007,12 @@ Vagrant.configure("2") do |config|
           system("bash", script, kubeconfig, "600")
         end
       end
-      worker.vm.network :private_network,
+      worker.vm.network :public_network,
         libvirt__network_name: libvirt_network_name,
-        libvirt__dhcp_enabled: false,
-        ip: worker_ip
+        libvirt__type: "network",
+        libvirt__portgroup: "longhorn-storage",
+        auto_config: false,
+        libvirt__trust_guest_rx_filters: true
       worker.vm.hostname = worker_name
       worker.vm.disk :disk, size: "100GB", primary: true
       worker.vm.provider :libvirt do |provider|
@@ -971,7 +1053,8 @@ Vagrant.configure("2") do |config|
         inline: provision_all_node_script,
         env: { NODE_IP: worker_ip, NODE_NAME: worker_name, NODE_ROLE: "worker",
                NODE_IPV6:    (network_stack == "ipv6" || network_stack == "dual" || network_stack == "dual6") ? worker_ipv6 : "",
-               NODE_BIND_IP: worker_bind_ip }
+               NODE_BIND_IP: worker_bind_ip,
+               STORAGE_HOST_IPV4: worker_storage_ipv4, STORAGE_HOST_IPV6: worker_storage_ipv6 }
       worker.vm.provision "worker",
         type: "shell",
         after: "master",
