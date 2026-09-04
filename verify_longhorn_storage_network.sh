@@ -207,19 +207,17 @@ if [ -z "$ENDPOINTS" ]; then
     exit 1
 fi
 
-echo "Checking V2 storage endpoint reachability from every instance-manager node:"
+echo "Checking V2 storage endpoint TCP connectivity from every instance-manager node:"
 for node_name in $NODE_NAMES; do
     printf '%s\n' "$ENDPOINTS" |
         while IFS="$(printf '\t')" read -r endpoint_kind endpoint_name endpoint_ip endpoint_port; do
             echo "  ${node_name} -> ${endpoint_kind} ${endpoint_name} ${endpoint_ip}:${endpoint_port}"
-            case "$endpoint_ip" in
-                *:*) ping_command="ping -6" ;;
-                *) ping_command="ping" ;;
-            esac
             (
                 cd "$SCRIPT_DIR"
-                vagrant ssh "$node_name" -c "$ping_command -c 1 -W 5 '$endpoint_ip'" </dev/null
+                vagrant ssh "$node_name" \
+                    -c "nc -z -w 5 '$endpoint_ip' '$endpoint_port'" </dev/null
             )
+            echo "    PASS"
         done
 done
 
