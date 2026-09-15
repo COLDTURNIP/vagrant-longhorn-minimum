@@ -163,10 +163,10 @@ longhorn_storage_network_ipv6_cidr = ["ipv6", "dual", "dual6"].include?(network_
 
 
 # Backup target selection. Requires `vagrant destroy -f && vagrant up` to apply.
-#   "minio" - S3-compatible object storage (default)
-#   "nfs"   - NFS server (use to reproduce NFS-specific issues such as longhorn/longhorn#12896)
+#   "seaweedfs" - S3-compatible object storage (default)
+#   "nfs"       - NFS server (use to reproduce NFS-specific issues such as longhorn/longhorn#12896)
 #backup_target = "nfs"
-backup_target = "minio"
+backup_target = "seaweedfs"
 
 master_host = "libvirt-ubuntu-k3s-master"
 master_ip   = "#{libvirt_network_subnet_ipv4}.20"
@@ -288,10 +288,10 @@ longhorn_configmap_resource_lines = longhorn_default_settings
   .map    { |k, v| "    \"#{k}\": #{v}" }
   .join("\n")
 
-# All node IPs for the Minio TLS cert SAN so the cert is valid for access from any node.
-minio_san_ips = [master_ip] + workers.values.map { |w| w[:ip] }
+# All node IPs for the S3 TLS cert SAN so the cert is valid for access from any node.
+s3_san_ips = [master_ip] + workers.values.map { |w| w[:ip] }
 if network_stack =~ /ipv6|dual/
-  minio_san_ips += [master_ipv6] + workers.values.map { |w| w[:ipv6] }
+  s3_san_ips += [master_ipv6] + workers.values.map { |w| w[:ipv6] }
 end
 
 # Cgroup v1 for legacy K8s support. Rebooting needed.
@@ -805,11 +805,11 @@ provision_master_script = <<~SHELL
       kubectl -n default rollout status deploy/longhorn-test-nfs --timeout=180s
       echo "NFS backup store ready: nfs://longhorn-test-nfs-svc.default:/opt/backupstore"
     else
-      echo "Deploy Minio backup store ..."
+      echo "Deploy SeaweedFS backup store ..."
       kubectl create namespace longhorn-system 2>/dev/null || true
-      (cd /tmp && MINIO_SAN_IPS="#{minio_san_ips.join(',')}" KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /vagrant/deploy_minio.sh)
+      (cd /tmp && S3_SAN_IPS="#{s3_san_ips.join(',')}" KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /vagrant/deploy_seaweedfs.sh)
       kubectl -n default rollout status deploy/longhorn-backup-target --timeout=180s
-      echo "Minio backup store ready: s3://backupbucket@us-east-1/ secret=longhorn-backup-target-secret"
+      echo "SeaweedFS backup store ready: s3://backupbucket@us-east-1/ secret=longhorn-backup-target-secret"
     fi
 
     SHELL
