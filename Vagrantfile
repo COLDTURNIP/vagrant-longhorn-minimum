@@ -163,10 +163,10 @@ longhorn_storage_network_ipv6_cidr = ["ipv6", "dual", "dual6"].include?(network_
 
 
 # Backup target selection. Requires `vagrant destroy -f && vagrant up` to apply.
-#   "seaweedfs" - S3-compatible object storage (default)
-#   "nfs"       - NFS server (use to reproduce NFS-specific issues such as longhorn/longhorn#12896)
+#   "garage" - S3-compatible object storage behind Nginx TLS (default)
+#   "nfs"     - NFS server (use to reproduce NFS-specific issues such as longhorn/longhorn#12896)
 #backup_target = "nfs"
-backup_target = "seaweedfs"
+backup_target = "garage"
 
 master_host = "libvirt-ubuntu-k3s-master"
 master_ip   = "#{libvirt_network_subnet_ipv4}.20"
@@ -579,8 +579,7 @@ provision_master_script = <<~SHELL
     echo "Using flannel interface: ${FLANNEL_IFACE}"
 
     INSTALL_K3S_ARGS=(
-    -v 9
-    --token "#{k3s_token}"
+    --agent-token "#{k3s_token}"
     --kubelet-arg=node-status-update-frequency=5s
     --kubelet-arg=hairpin-mode=promiscuous-bridge
     #--kubelet-arg=v=9
@@ -593,7 +592,6 @@ provision_master_script = <<~SHELL
     --bind-address=#{master_bind_ip}
     --node-external-ip=#{master_node_ip}
     --node-taint='node-role.kubernetes.io/control-plane:NoSchedule'
-    --node-taint='node-role.kubernetes.io/master=true:NoExecute'
     --flannel-iface "${FLANNEL_IFACE}"
     #--disable-helm-controller
     --cluster-cidr=#{k3s_cluster_cidr}
@@ -631,10 +629,9 @@ provision_master_script = <<~SHELL
       sleep 1
     done
     kubectl label node "$NODE_NAME" node-role.kubernetes.io/master=true --overwrite
-    # Bootstrap Helm jobs do not tolerate the permanent control-plane taints.
-    # Remove them until Multus and its NetworkAttachmentDefinition CRD exist.
+    # Bootstrap Helm jobs do not tolerate the permanent control-plane taint.
+    # Remove it until Multus and its NetworkAttachmentDefinition CRD exist.
     kubectl taint node "$NODE_NAME" node-role.kubernetes.io/control-plane:NoSchedule- || true
-    kubectl taint node "$NODE_NAME" node-role.kubernetes.io/master:NoExecute- || true
     kubectl -n kube-system patch deployment coredns \
       --type='merge' \
       -p '
@@ -650,11 +647,6 @@ provision_master_script = <<~SHELL
                 "key": "node-role.kubernetes.io/control-plane",
                 "operator": "Exists",
                 "effect": "NoSchedule"
-              },
-              {
-                "key": "node-role.kubernetes.io/master",
-                "operator": "Exists",
-                "effect": "NoExecute"
               }
             ]
           }
@@ -720,7 +712,6 @@ provision_master_script = <<~SHELL
     YAML
 
     kubectl taint node "$NODE_NAME" node-role.kubernetes.io/control-plane=:NoSchedule --overwrite
-    kubectl taint node "$NODE_NAME" node-role.kubernetes.io/master=:NoExecute --overwrite
 
     echo 'Install CSI snapshot support ...'
     kubectl kustomize https://github.com/kubernetes-csi/external-snapshotter/client/config/crd | kubectl create -f -
@@ -737,10 +728,6 @@ provision_master_script = <<~SHELL
               "key": "node-role.kubernetes.io/control-plane",
               "operator": "Exists",
               "effect": "NoSchedule"
-            }, {
-              "key": "node-role.kubernetes.io/master",
-              "operator": "Exists",
-              "effect": "NoExecute"
             }
           ]
         }
@@ -801,15 +788,15 @@ provision_master_script = <<~SHELL
 
     if [[ "#{backup_target}" == "nfs" ]]; then
       echo "Deploy NFS backup store ..."
-      (cd /tmp && KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /vagrant/deploy_nfs.sh)
+      (cd /tmp && KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /tmp/deploy_nfs.sh)
       kubectl -n default rollout status deploy/longhorn-test-nfs --timeout=180s
       echo "NFS backup store ready: nfs://longhorn-test-nfs-svc.default:/opt/backupstore"
     else
-      echo "Deploy SeaweedFS backup store ..."
+      echo "Deploy Garage backup store ..."
       kubectl create namespace longhorn-system 2>/dev/null || true
-      (cd /tmp && S3_SAN_IPS="#{s3_san_ips.join(',')}" KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /vagrant/deploy_seaweedfs.sh)
+      (cd /tmp && S3_SAN_IPS="#{s3_san_ips.join(',')}" KUBECONFIG=/etc/rancher/k3s/k3s.yaml bash /tmp/deploy_garage.sh)
       kubectl -n default rollout status deploy/longhorn-backup-target --timeout=180s
-      echo "SeaweedFS backup store ready: s3://backupbucket@us-east-1/ secret=longhorn-backup-target-secret"
+      echo "Garage backup store ready through Nginx TLS: s3://backupbucket@us-east-1/ secret=longhorn-backup-target-secret"
     fi
 
     SHELL
@@ -980,6 +967,11 @@ Vagrant.configure("2") do |config|
         }
       #provider.management_network_keep = true
     end
+    backupstore_script = backup_target == "nfs" ? "deploy_nfs.sh" : "deploy_garage.sh"
+    master.vm.provision "backupstore_script",
+      type: "file",
+      source: backupstore_script,
+      destination: "/tmp/#{backupstore_script}"
     master.vm.provision "master_node_setup",
       type: "shell",
       inline: provision_all_node_script,

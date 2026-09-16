@@ -30,8 +30,8 @@ fi
 SERVICE=${NAME}-service
 DOMAIN="${SERVICE}.default"
 DAYS=1000
-KEY_FILE="vagrant-seaweedfs-private.key"
-CERT_FILE="vagrant-seaweedfs-selfsigned.crt"
+KEY_FILE="vagrant-garage-private.key"
+CERT_FILE="vagrant-garage-selfsigned.crt"
 SAN="DNS:${DOMAIN},DNS:localhost${san_ip}"
 
 # Generate a private key
@@ -56,6 +56,7 @@ s3_endpoint="https://${s3_domain}:${s3_port}"
 s3_external_endpoint="https://${s3_host}:${s3_port}"
 encoded_s3_endpoint=$(echo -n $s3_endpoint | base64)
 encoded_s3_external_endpoint=$(echo -n $s3_external_endpoint | base64)
+rpc_secret=$(openssl rand -hex 32)
 
 kubectl apply -f - <<EOF
 apiVersion: v1
@@ -84,22 +85,66 @@ data:
   AWS_ENDPOINTS: $encoded_s3_endpoint # $s3_endpoint
   AWS_CERT: $encoded_cert
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${NAME}-config
+  namespace: default
+data:
+  garage.toml: |
+    metadata_dir = "/data/meta"
+    data_dir = "/data/data"
+    db_engine = "sqlite"
+    replication_factor = 1
+    rpc_bind_addr = "127.0.0.1:3901"
+    rpc_public_addr = "127.0.0.1:3901"
+    rpc_secret = "$rpc_secret"
+
+    [s3_api]
+    s3_region = "us-east-1"
+    api_bind_addr = "127.0.0.1:3900"
+    root_domain = ".s3.garage.localhost"
+  nginx.conf: |
+    events {}
+    http {
+      server {
+        listen 9000 ssl;
+        listen [::]:9000 ssl;
+        server_name _;
+
+        ssl_certificate /certs/public.crt;
+        ssl_certificate_key /certs/private.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+
+        client_max_body_size 0;
+        proxy_request_buffering off;
+        proxy_buffering off;
+
+        location / {
+          proxy_pass http://127.0.0.1:3900;
+          proxy_http_version 1.1;
+          proxy_set_header Host \$http_host;
+          proxy_set_header Connection "";
+        }
+      }
+    }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ${NAME}
   namespace: default
   labels:
-    app: seaweedfs-${NAME}
+    app: garage-${NAME}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: seaweedfs-${NAME}
+      app: garage-${NAME}
   template:
     metadata:
       labels:
-        app: seaweedfs-${NAME}
+        app: garage-${NAME}
     spec:
       nodeSelector:
         node-role.kubernetes.io/control-plane: "true"
@@ -111,9 +156,12 @@ spec:
         key: node-role.kubernetes.io/master
         operator: Exists
       volumes:
-      - name: seaweedfs-volume
+      - name: garage-volume
         emptyDir: {}
-      - name: seaweedfs-certificates
+      - name: garage-config
+        configMap:
+          name: ${NAME}-config
+      - name: garage-certificates
         secret:
           secretName: $secret_name
           items:
@@ -122,38 +170,57 @@ spec:
           - key: AWS_CERT_KEY
             path: private.key
       containers:
-      - name: seaweedfs
-        image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+      - name: garage
+        image: dxflrs/garage:v2.4.1@sha256:9c96caa2612d3411acc5b0e6701fb238dbfba33e533a6d7d3d811a4b12d0d020
+        command:
+        - /garage
+        - server
         args:
-        - mini
-        - -dir=/data
-        - -webdav=false
-        - -admin.ui=false
-        - -s3.port=9000
-        - -s3.cert.file=/certs/public.crt
-        - -s3.key.file=/certs/private.key
-        - -s3.port.iceberg=0
-        - -s3.port.lance=0
+        - --single-node
+        - --default-bucket
         env:
-        - name: AWS_ACCESS_KEY_ID
+        - name: GARAGE_CONFIG_FILE
+          value: /etc/garage.toml
+        - name: GARAGE_DEFAULT_ACCESS_KEY
           valueFrom:
             secretKeyRef:
               name: $secret_name
               key: AWS_ACCESS_KEY_ID
-        - name: AWS_SECRET_ACCESS_KEY
+        - name: GARAGE_DEFAULT_SECRET_KEY
           valueFrom:
             secretKeyRef:
               name: $secret_name
               key: AWS_SECRET_ACCESS_KEY
-        - name: S3_BUCKET
+        - name: GARAGE_DEFAULT_BUCKET
           value: backupbucket
         ports:
-        - containerPort: 9000
+        - containerPort: 3900
+        readinessProbe:
+          exec:
+            command:
+            - /garage
+            - status
         volumeMounts:
-        - name: seaweedfs-volume
-          mountPath: "/data"
-        - name: seaweedfs-certificates
-          mountPath: "/certs"
+        - name: garage-volume
+          mountPath: /data
+        - name: garage-config
+          mountPath: /etc/garage.toml
+          subPath: garage.toml
+          readOnly: true
+      - name: nginx
+        image: nginx:1.31.6-alpine@sha256:17ad11d84df6c69e327c0894125f712ec1f1de627b5e5ed7e12ca2ed8cd5daf8
+        ports:
+        - containerPort: 9000
+        readinessProbe:
+          tcpSocket:
+            port: 9000
+        volumeMounts:
+        - name: garage-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+          readOnly: true
+        - name: garage-certificates
+          mountPath: /certs
           readOnly: true
 ---
 apiVersion: v1
@@ -163,7 +230,7 @@ metadata:
   namespace: default
 spec:
   selector:
-    app: seaweedfs-${NAME}
+    app: garage-${NAME}
   ports:
     - port: 9000
       targetPort: 9000
@@ -174,7 +241,7 @@ EOF
 kubectl -n default rollout restart deploy/${NAME}
 
 cat <<NOTE
-SeaweedFS backupstore is now serving as deployment default/${NAME}:
+Garage backupstore is now serving through Nginx with self-signed TLS as deployment default/${NAME}:
 
   Backup Target: s3://backupbucket@us-east-1/
   Backup Target Credential Secret: $secret_name
