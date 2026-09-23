@@ -102,7 +102,7 @@ k3s_bin_url = k3s_version == "latest" \
   : "https://github.com/k3s-io/k3s/releases/download/#{k3s_version.gsub('+', '%2B')}/k3s"
 
 #longhorn_version = ''
-longhorn_version = 'master'
+longhorn_version = ''
 #longhorn_version = 'v1.11.x'
 #longhorn_version = 'v1.11.0'
 #longhorn_version = 'v1.10.2'
@@ -216,7 +216,6 @@ k3s_token = "libvirt-ubuntu-token"
 
 # block disk is needed by Longhorn engine V2
 enable_longhorn_v2_engine = "true"
-#enable_longhorn_v2_engine = "false"
 k3s_data_disk_device = "/dev/vdb"
 k3s_data_disk_path = "/var/lib/rancher"
 system_log_disk_device = "/dev/vdc"
@@ -236,7 +235,7 @@ longhorn_worker_node_default_disk_config = [
     "diskType" => "block",
     "storageReserved" => 0,
   },
-]
+].reject { |disk| disk["diskType"] == "block" && enable_longhorn_v2_engine != "true" }
 longhorn_master_node_default_disk_config = [
   {
     "path" => longhorn_default_fs_disk_path,
@@ -250,7 +249,7 @@ longhorn_master_node_default_disk_config = [
     "diskType" => "block",
     "storageReserved" => 0,
   },
-]
+].reject { |disk| disk["diskType"] == "block" && enable_longhorn_v2_engine != "true" }
 
 # Single source of truth for Longhorn default settings.
 # Keys: kebab-case (native Longhorn format).
@@ -423,8 +422,8 @@ provision_all_node_script = <<~SHELL
     LOGROTATE_CONFIG
 
     echo 'Disable multipath ...'
-    systemctl stop multipath-tools.service multipathd.socket
-    systemctl disable multipath-tools.service multipathd.socket
+    systemctl stop multipathd.service multipathd.socket
+    systemctl disable multipathd.service multipathd.socket
 
     echo 'Install other CLI tools ...'
     curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
@@ -435,9 +434,13 @@ provision_all_node_script = <<~SHELL
     #snap install k9s --devmode
 
     echo 'Install Longhorn CLI tool #{longhorn_cli_version} ...'
-    curl -sSfL -o ./longhornctl https://github.com/longhorn/cli/releases/download/#{longhorn_cli_version}/longhornctl-linux-amd64
-    chmod +x ./longhornctl
-    mv ./longhornctl /usr/bin/
+    if [[ -f "/vagrant_shared/longhornctl-#{longhorn_cli_version}" ]]; then
+      install -m 0755 "/vagrant_shared/longhornctl-#{longhorn_cli_version}" /usr/bin/longhornctl
+    else
+      curl -sSfL -o ./longhornctl https://github.com/longhorn/cli/releases/download/#{longhorn_cli_version}/longhornctl-linux-amd64
+      chmod +x ./longhornctl
+      mv ./longhornctl /usr/bin/
+    fi
 
     # Normalize the second VM NIC to a stable name. Master and worker PCI layouts
     # assign different predictable names, but one NAD must name the same parent
@@ -601,6 +604,10 @@ provision_master_script = <<~SHELL
     )
 
     export K3S_KUBECONFIG_MODE="644"
+    if [[ -f "/vagrant_shared/k3s-#{k3s_version}" ]]; then
+      install -m 0755 "/vagrant_shared/k3s-#{k3s_version}" /usr/local/bin/k3s
+      export INSTALL_K3S_SKIP_DOWNLOAD=true
+    fi
     curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="#{k3s_version}" INSTALL_K3S_EXEC="server" sh -s - "${INSTALL_K3S_ARGS[@]}"
     #curl -sfL https://get.k3s.io | sh -s - "${INSTALL_K3S_ARGS[@]}"
 
@@ -820,7 +827,11 @@ provision_worker_script = <<~SHELL
 
     # Download the k3s binary directly (air-gap method) to probe for flag support
     # before finalising INSTALL_K3S_ARGS, without triggering a full installation.
-    curl -sfL "#{k3s_bin_url}" -o /usr/local/bin/k3s
+    if [[ -f "/vagrant_shared/k3s-#{k3s_version}" ]]; then
+      install -m 0755 "/vagrant_shared/k3s-#{k3s_version}" /usr/local/bin/k3s
+    else
+      curl -sfL "#{k3s_bin_url}" -o /usr/local/bin/k3s
+    fi
     chmod +x /usr/local/bin/k3s
 
     # --bind-address was added to k3s agent after v1.23; probe the installed binary so
