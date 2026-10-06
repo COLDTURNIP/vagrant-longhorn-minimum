@@ -91,6 +91,14 @@ printf '%s' "$INSTANCE_MANAGER_JSON" | jq -r --arg network "$STORAGE_NETWORK" '
     "  \($pod): \(.ips | join(","))"
 '
 
+STORAGE_IPS=$(printf '%s' "$INSTANCE_MANAGER_JSON" | jq --arg network "$STORAGE_NETWORK" '
+    [.items[] |
+        (.metadata.annotations["k8s.v1.cni.cncf.io/network-status"] | fromjson)[] |
+        select(.name == $network and .interface == "lhnet1") |
+        .ips[]
+    ] | unique
+')
+
 kubectl delete namespace "$DEMO_NAMESPACE" --ignore-not-found --wait=true --timeout=300s >/dev/null
 kubectl delete storageclass "$STORAGE_CLASS" --ignore-not-found >/dev/null
 kubectl create namespace "$DEMO_NAMESPACE" >/dev/null
@@ -172,16 +180,10 @@ while :; do
     sleep 5
 done
 
-printf '%s' "$REPLICA_JSON" | jq -e --arg volume "$VOLUME_NAME" '
-    def is_storage_ip:
-        if startswith("192.168.156.") then
-            (split(".")[-1] | tonumber) >= 128
-        else
-            startswith("fd00:dead:beef:")
-        end;
+printf '%s' "$REPLICA_JSON" | jq -e --arg volume "$VOLUME_NAME" --argjson storage_ips "$STORAGE_IPS" '
     all(
         .items[] | select(.spec.volumeName == $volume);
-        .status.storageIP | is_storage_ip
+        .status.storageIP as $ip | ($storage_ips | index($ip)) != null
     )
 ' >/dev/null
 

@@ -145,22 +145,33 @@ libvirt_network_subnet_ipv6 = "fd00:dead:beef"
 network_stack = "dual"
 #network_stack = "dual6"
 
-# Multus uses a stable name for the second VM NIC. The guest provisioner
-# renames the box/provider-specific interface and persists the name with netplan.
+# Opt-in secondary pod network. Recreate the VMs after changing this switch or
+# network_stack; reprovisioning does not remove existing network attachments.
+# Uses ipvlan L3 with per-node subnets and persistent host access. The second VM
+# NIC is also used by K3s and remains present when storage networking is disabled.
+enable_storage_network = false
+
+# Use a stable name for the second VM NIC on every node.
 multus_parent_interface = "lhstorage0"
 multus_chart_url = "https://raw.githubusercontent.com/rancher/rke2-charts/main/assets/rke2-multus/rke2-multus-v4.2.418.tgz"
 longhorn_storage_network_name = "vagrant-storage-network"
-longhorn_storage_network_ip_ranges = case network_stack
-                                      when "ipv6"
-                                        '[{"range":"fd00:dead:beef::8000/113","range_start":"fd00:dead:beef::8010"}]'
-                                      when "dual", "dual6"
-                                        '[{"range":"192.168.156.128/25","range_start":"192.168.156.140"},{"range":"fd00:dead:beef::8000/113","range_start":"fd00:dead:beef::8010"}]'
-                                      else
-                                        '[{"range":"192.168.156.128/25","range_start":"192.168.156.140"}]'
-                                      end
-longhorn_storage_network_ipv4_cidr = network_stack == "ipv6" ? "" : "192.168.156.128/25"
-longhorn_storage_network_ipv6_cidr = ["ipv6", "dual", "dual6"].include?(network_stack) ? "fd00:dead:beef::8000/113" : ""
-
+longhorn_storage_network_setting = enable_storage_network ? "longhorn-system/#{longhorn_storage_network_name}" : ""
+longhorn_storage_network_ipv4_enabled = ["ipv4", "dual", "dual6"].include?(network_stack)
+longhorn_storage_network_ipv6_enabled = ["ipv6", "dual", "dual6"].include?(network_stack)
+longhorn_storage_network_subnet_file = "/run/flannel/multus-storage-subnet.env"
+longhorn_storage_network_mtu = 1450
+longhorn_storage_network_config = {
+  cniVersion: "0.3.1",
+  type: "flannel",
+  subnetFile: longhorn_storage_network_subnet_file,
+  dataDir: "/var/lib/cni/multus-storage-network",
+  delegate: {
+    type: "ipvlan",
+    master: multus_parent_interface,
+    mode: "l3",
+    capabilities: { ips: true },
+  },
+}
 
 # Backup target selection. Requires `vagrant destroy -f && vagrant up` to apply.
 #   "garage" - S3-compatible object storage behind Nginx TLS (default)
@@ -171,16 +182,20 @@ backup_target = "garage"
 master_host = "libvirt-ubuntu-k3s-master"
 master_ip   = "#{libvirt_network_subnet_ipv4}.20"
 master_ipv6 = "#{libvirt_network_subnet_ipv6}::20"  # IPv6: master storage IPv6
-master_storage_ipv4 = "192.168.156.130"
-master_storage_ipv6 = "fd00:dead:beef::8002"
 master_cpu  = "2"
 master_memory = "3072"
 
 workers = {
-  "libvirt-ubuntu-k3s-worker1" => { ip: "#{libvirt_network_subnet_ipv4}.21", ipv6: "#{libvirt_network_subnet_ipv6}::21", storage_ipv4: "192.168.156.131", storage_ipv6: "fd00:dead:beef::8003" },
-  "libvirt-ubuntu-k3s-worker2" => { ip: "#{libvirt_network_subnet_ipv4}.22", ipv6: "#{libvirt_network_subnet_ipv6}::22", storage_ipv4: "192.168.156.132", storage_ipv6: "fd00:dead:beef::8004" },
-  "libvirt-ubuntu-k3s-worker3" => { ip: "#{libvirt_network_subnet_ipv4}.23", ipv6: "#{libvirt_network_subnet_ipv6}::23", storage_ipv4: "192.168.156.133", storage_ipv6: "fd00:dead:beef::8005" },
+  "libvirt-ubuntu-k3s-worker1" => { ip: "#{libvirt_network_subnet_ipv4}.21", ipv6: "#{libvirt_network_subnet_ipv6}::21" },
+  "libvirt-ubuntu-k3s-worker2" => { ip: "#{libvirt_network_subnet_ipv4}.22", ipv6: "#{libvirt_network_subnet_ipv6}::22" },
+  "libvirt-ubuntu-k3s-worker3" => { ip: "#{libvirt_network_subnet_ipv4}.23", ipv6: "#{libvirt_network_subnet_ipv6}::23" },
 }
+
+# Match each node's subnet ID in the persistent host setup and Flannel CNI file.
+longhorn_storage_subnet_ids = ([master_host] + workers.keys).each_with_index.to_h { |name, index| [name, index + 1] }
+longhorn_storage_network_peers = ([{ ip: master_ip, ipv6: master_ipv6 }] + workers.values)
+  .each_with_index.map { |addrs, index| "#{index + 1} #{addrs[:ip]} #{addrs[:ipv6]}" }
+  .join("\n")
 
 # K3s addresses and flags derived from network_stack. Do not edit these directly.
 master_bind_ip        = (network_stack == "ipv6" || network_stack == "dual6") ? master_ipv6 : master_ip
@@ -263,7 +278,7 @@ longhorn_default_settings = {
   "deleting-confirmation-flag"                   => %q("true"),
   "storage-reserved-percentage-for-default-disk" => %q("0"),
   "allow-collecting-longhorn-usage-metrics"      => %q("false"),
-  "storage-network"                               => %Q("#{longhorn_storage_network_name.empty? ? "" : "longhorn-system/#{longhorn_storage_network_name}"}"),
+  "storage-network"                               => %Q("#{longhorn_storage_network_setting}"),
   "backup-target"                                => backup_target == "nfs" \
     ? %q("nfs://longhorn-test-nfs-svc.default:/opt/backupstore") \
     : %q("s3://backupbucket@us-east-1/"),
@@ -477,45 +492,70 @@ provision_all_node_script = <<~SHELL
     ip addr show "${STORAGE_IFACE}"
     echo "export STORAGE_IFACE=${STORAGE_IFACE}" >> /etc/environment
 
-    # A macvlan parent cannot communicate directly with its children. Add a
-    # host-side macvlan peer so host-networked V2 NVMe/TCP initiators can reach
-    # both local and remote storage-network endpoints.
-    STORAGE_HOST_IPV4="${STORAGE_HOST_IPV4:--}"
-    STORAGE_HOST_IPV6="${STORAGE_HOST_IPV6:--}"
-    POD_STORAGE_IPV4_CIDR="#{longhorn_storage_network_ipv4_cidr}"
-    POD_STORAGE_IPV6_CIDR="#{longhorn_storage_network_ipv6_cidr}"
-    [[ -n "${POD_STORAGE_IPV4_CIDR}" ]] || POD_STORAGE_IPV4_CIDR="-"
-    [[ -n "${POD_STORAGE_IPV6_CIDR}" ]] || POD_STORAGE_IPV6_CIDR="-"
-
+    if #{enable_storage_network}; then
+    # A host-side ipvlan sibling provides access to local pod storage addresses.
+    # Use each subnet's gateway address: host-local IPAM reserves it for the host.
     cat >/usr/local/sbin/setup-longhorn-storage-host <<'SCRIPT'
     #!/bin/bash
     set -euo pipefail
 
     parent_interface=$1
-    host_ipv4=$2
-    pod_ipv4_cidr=$3
-    host_ipv6=$4
-    pod_ipv6_cidr=$5
+    local_subnet_id=$2
     host_interface=lhstoragehost
+    host_ipv4="192.168.${local_subnet_id}.1"
+    host_ipv6="fd00:168:${local_subnet_id}::1"
+
+    mkdir -p /run/flannel
+    printf 'FLANNEL_MTU=#{longhorn_storage_network_mtu}\nFLANNEL_IPMASQ=true\n' >#{longhorn_storage_network_subnet_file}
+    : >/etc/sysctl.d/90-longhorn-storage-network.conf
+    if #{longhorn_storage_network_ipv4_enabled}; then
+      printf 'FLANNEL_NETWORK=192.168.0.0/16\nFLANNEL_SUBNET=192.168.%s.0/24\n' "${local_subnet_id}" >>#{longhorn_storage_network_subnet_file}
+      echo 'net.ipv4.ip_forward = 1' >>/etc/sysctl.d/90-longhorn-storage-network.conf
+      sysctl -w net.ipv4.ip_forward=1
+    fi
+    if #{longhorn_storage_network_ipv6_enabled}; then
+      printf 'FLANNEL_IPV6_NETWORK=fd00:168::/48\nFLANNEL_IPV6_SUBNET=fd00:168:%s::/64\n' "${local_subnet_id}" >>#{longhorn_storage_network_subnet_file}
+      echo 'net.ipv6.conf.all.forwarding = 1' >>/etc/sysctl.d/90-longhorn-storage-network.conf
+      sysctl -w net.ipv6.conf.all.forwarding=1
+    fi
 
     ip link del "${host_interface}" 2>/dev/null || true
-    ip link add "${host_interface}" link "${parent_interface}" type macvlan mode bridge
-
-    if [[ "${pod_ipv4_cidr}" != "-" ]]; then
+    ip link add "${host_interface}" link "${parent_interface}" type ipvlan mode l3
+    ip link set "${host_interface}" mtu #{longhorn_storage_network_mtu}
+    if #{longhorn_storage_network_ipv4_enabled}; then
       ip address add "${host_ipv4}/32" dev "${host_interface}"
     fi
-    if [[ "${pod_ipv6_cidr}" != "-" ]]; then
+    if #{longhorn_storage_network_ipv6_enabled}; then
       ip -6 address add "${host_ipv6}/128" dev "${host_interface}" nodad
     fi
-
     ip link set "${host_interface}" up
 
-    if [[ "${pod_ipv4_cidr}" != "-" ]]; then
-      ip route replace "${pod_ipv4_cidr}" dev "${host_interface}" src "${host_ipv4}"
-    fi
-    if [[ "${pod_ipv6_cidr}" != "-" ]]; then
-      ip -6 route replace "${pod_ipv6_cidr}" dev "${host_interface}" src "${host_ipv6}"
-    fi
+    # Static remote-subnet routes use the peers' storage-facing VM addresses.
+    # Less-preferred unreachable routes prevent primary-default-route fallback
+    # if a preferred storage route is removed. Do not block the entire /16:
+    # it also contains the VM underlay and management addresses.
+    while read -r subnet_id peer_ipv4 peer_ipv6; do
+      if #{longhorn_storage_network_ipv4_enabled}; then
+        subnet="192.168.${subnet_id}.0/24"
+        ip route replace unreachable "${subnet}" metric 32760
+        if [[ "${subnet_id}" == "${local_subnet_id}" ]]; then
+          ip route replace "${subnet}" dev "${host_interface}" src "${host_ipv4}"
+        else
+          ip route replace "${subnet}" via "${peer_ipv4}" dev "${parent_interface}" src "${host_ipv4}"
+        fi
+      fi
+      if #{longhorn_storage_network_ipv6_enabled}; then
+        subnet="fd00:168:${subnet_id}::/64"
+        ip -6 route replace unreachable "${subnet}" metric 32760
+        if [[ "${subnet_id}" == "${local_subnet_id}" ]]; then
+          ip -6 route replace "${subnet}" dev "${host_interface}" src "${host_ipv6}"
+        else
+          ip -6 route replace "${subnet}" via "${peer_ipv6}" dev "${parent_interface}" src "${host_ipv6}"
+        fi
+      fi
+    done <<'PEERS'
+    #{longhorn_storage_network_peers}
+    PEERS
     SCRIPT
     chmod 0755 /usr/local/sbin/setup-longhorn-storage-host
 
@@ -529,7 +569,7 @@ provision_all_node_script = <<~SHELL
     [Service]
     Type=oneshot
     RemainAfterExit=yes
-    ExecStart=/usr/local/sbin/setup-longhorn-storage-host #{multus_parent_interface} ${STORAGE_HOST_IPV4} ${POD_STORAGE_IPV4_CIDR} ${STORAGE_HOST_IPV6} ${POD_STORAGE_IPV6_CIDR}
+    ExecStart=/usr/local/sbin/setup-longhorn-storage-host #{multus_parent_interface} ${STORAGE_SUBNET_ID}
 
     [Install]
     WantedBy=multi-user.target
@@ -542,10 +582,10 @@ provision_all_node_script = <<~SHELL
     fi
     systemctl is-active --quiet longhorn-storage-host.service
 
-    echo "Host route to the Longhorn storage network:"
-    [[ "${POD_STORAGE_IPV4_CIDR}" == "-" ]] || ip route show "${POD_STORAGE_IPV4_CIDR}"
-    [[ "${POD_STORAGE_IPV6_CIDR}" == "-" ]] || ip -6 route show "${POD_STORAGE_IPV6_CIDR}"
-
+    echo "Host routes to the Longhorn storage network:"
+    ip route show dev lhstoragehost
+    ip -6 route show dev lhstoragehost
+    fi
 
     if [ "${ROLE}" != "master" ]; then
       echo 'Prepare disks for Longhorn ...'
@@ -661,7 +701,8 @@ provision_master_script = <<~SHELL
       }
     }'
 
-    echo 'Install Multus and Whereabouts ...'
+    if #{enable_storage_network}; then
+    echo 'Install Multus ...'
     kubectl apply -f - <<YAML
     apiVersion: helm.cattle.io/v1
     kind: HelmChart
@@ -681,7 +722,7 @@ provision_master_script = <<~SHELL
             multusAutoconfigDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
         rke2-whereabouts:
           fullnameOverride: whereabouts
-          enabled: true
+          enabled: false
           cniConf:
             confDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
             binDir: /var/lib/rancher/k3s/data/cni/
@@ -705,18 +746,9 @@ provision_master_script = <<~SHELL
       namespace: longhorn-system
     spec:
       config: |-
-        {
-          "cniVersion": "1.0.0",
-          "type": "macvlan",
-          "master": "#{multus_parent_interface}",
-          "mode": "bridge",
-          "ipam": {
-            "type": "whereabouts",
-            "ipRanges": #{longhorn_storage_network_ip_ranges},
-            "configuration_path": "/var/lib/rancher/k3s/agent/etc/cni/net.d/whereabouts.d/whereabouts.conf"
-          }
-        }
+        #{longhorn_storage_network_config.to_json}
     YAML
+    fi
 
     kubectl taint node "$NODE_NAME" node-role.kubernetes.io/control-plane=:NoSchedule --overwrite
 
@@ -789,7 +821,7 @@ provision_master_script = <<~SHELL
       done
       kubectl -n longhorn-system patch setting.longhorn.io storage-network \
         --type=merge \
-        -p '{"value":"longhorn-system/#{longhorn_storage_network_name}"}'
+        -p '{"value":"#{longhorn_storage_network_setting}"}'
 
     fi
 
@@ -821,7 +853,7 @@ provision_worker_script = <<~SHELL
     --kubelet-arg=node-status-update-frequency=5s
     --kubelet-arg=hairpin-mode=promiscuous-bridge
     --server #{master_server_url}
-    --node-taint=longhorn.io/multus-not-ready=true:NoSchedule
+    #{enable_storage_network ? "--node-taint=longhorn.io/multus-not-ready=true:NoSchedule" : ""}
     --flannel-iface "${FLANNEL_IFACE}"
     )
 
@@ -857,9 +889,12 @@ provision_worker_script = <<~SHELL
     chown vagrant:vagrant ~vagrant/.kube/config
     export KUBECONFIG=~vagrant/.kube/config
 
+    if #{enable_storage_network}; then
     MULTUS_READY_TIMEOUT=$(( $(date +%s) + 300 ))
     while [ ! -x /var/lib/rancher/k3s/data/cni/multus ] ||
-          [ ! -x /var/lib/rancher/k3s/data/cni/whereabouts ] ||
+          [ ! -x /var/lib/rancher/k3s/data/cni/flannel ] ||
+          [ ! -x /var/lib/rancher/k3s/data/cni/ipvlan ] ||
+          [ ! -x /var/lib/rancher/k3s/data/cni/host-local ] ||
           [ ! -f /var/lib/rancher/k3s/agent/etc/cni/net.d/00-multus.conflist ]; do
       if [ "$(date +%s)" -ge "$MULTUS_READY_TIMEOUT" ]; then
         echo "ERROR: Multus did not become ready on ${NODE_NAME}"
@@ -868,6 +903,7 @@ provision_worker_script = <<~SHELL
       sleep 2
     done
     kubectl taint node "$NODE_NAME" longhorn.io/multus-not-ready-
+    fi
 
     echo "Waiting for node ${NODE_NAME} joining the Kubernetes cluster ..."
     kubectl wait --for=condition=Ready node/${NODE_NAME} --timeout=600s
@@ -988,7 +1024,7 @@ Vagrant.configure("2") do |config|
       inline: provision_all_node_script,
       env: { NODE_IP: master_ip, NODE_NAME: master_host, NODE_ROLE: "master",
              NODE_IPV6: (network_stack == "ipv6" || network_stack == "dual" || network_stack == "dual6") ? master_ipv6 : "",
-             STORAGE_HOST_IPV4: master_storage_ipv4, STORAGE_HOST_IPV6: master_storage_ipv6 }
+             STORAGE_SUBNET_ID: longhorn_storage_subnet_ids.fetch(master_host).to_s }
     master.vm.provision "master",
       type: "shell",
       inline: provision_master_script,
@@ -998,8 +1034,6 @@ Vagrant.configure("2") do |config|
   workers.each do |worker_name, worker_addrs|
     worker_ip           = worker_addrs[:ip]
     worker_ipv6         = worker_addrs[:ipv6]
-    worker_storage_ipv4 = worker_addrs[:storage_ipv4]
-    worker_storage_ipv6 = worker_addrs[:storage_ipv6]
     config.vm.define worker_name do |worker|
       worker.trigger.before :up do |trigger|
         trigger.name = "Wait master node"
@@ -1057,7 +1091,7 @@ Vagrant.configure("2") do |config|
         env: { NODE_IP: worker_ip, NODE_NAME: worker_name, NODE_ROLE: "worker",
                NODE_IPV6:    (network_stack == "ipv6" || network_stack == "dual" || network_stack == "dual6") ? worker_ipv6 : "",
                NODE_BIND_IP: worker_bind_ip,
-               STORAGE_HOST_IPV4: worker_storage_ipv4, STORAGE_HOST_IPV6: worker_storage_ipv6 }
+               STORAGE_SUBNET_ID: longhorn_storage_subnet_ids.fetch(worker_name).to_s }
       worker.vm.provision "worker",
         type: "shell",
         after: "master",

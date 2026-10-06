@@ -60,6 +60,72 @@ The kubeconfig file would be generated as `shared/libvirt-${DISTRO}-k3s.yaml`. A
 
 It will take more than 10 minutes to install reqired modules on each nodes.
 
+## Optional storage network
+
+Storage networking is disabled by default. To enable it, edit `Vagrantfile`:
+
+```ruby
+enable_storage_network = true
+network_stack = "dual"
+```
+
+The storage address families follow `network_stack`:
+
+| `network_stack` | Storage address families |
+|---|---|
+| `ipv4` | IPv4 |
+| `ipv6` | IPv6 |
+| `dual` | IPv4 and IPv6 |
+| `dual6` | IPv4 and IPv6; Kubernetes remains IPv6-first |
+
+Recreate the disposable VMs after changing either option. Reprovisioning is not
+an enable/disable migration and does not clean up old pod attachments or routes.
+Destroying the VMs removes their data:
+
+```bash
+vagrant destroy -f
+vagrant up
+```
+
+When enabled, provisioning installs Multus and the
+`longhorn-system/vagrant-storage-network` NAD. The NAD delegates to ipvlan L3 on
+`lhstorage0`, with host-local IP allocation from a separate subnet per node:
+
+| Node | IPv4 storage subnet | IPv6 storage subnet |
+|---|---|---|
+| Master | `192.168.1.0/24` | `fd00:168:1::/64` |
+| Worker1 | `192.168.2.0/24` | `fd00:168:2::/64` |
+| Worker2 | `192.168.3.0/24` | `fd00:168:3::/64` |
+| Worker3 | `192.168.4.0/24` | `fd00:168:4::/64` |
+
+Only the selected families are configured. Each node also gets a host-side
+ipvlan sibling, `lhstoragehost`, using its subnet's gateway address (`.1` or
+`::1`). Host-local IPAM reserves this address, so pods cannot allocate it.
+Local storage routes use the sibling; remote storage routes use the other VMs'
+addresses on `lhstorage0`. Less-preferred unreachable routes for these specific
+storage subnets prevent primary-default-route fallback if preferred routes are
+removed. This does not replace verification of isolation under other route or
+policy changes.
+
+The `longhorn-storage-host.service` recreates the host endpoint, routes, and
+Flannel CNI subnet file before K3s starts after reboot. Longhorn's generated Helm
+values select this NAD; provisioning also sets `storage-network` when
+`longhorn_version` requests an automatic Longhorn installation.
+
+When disabled, no Multus/NAD or storage host endpoint is provisioned, and the
+Longhorn storage-network value is empty. The second VM NIC remains because K3s
+uses it for node connectivity even without a secondary pod network.
+
+After installing Longhorn with storage networking enabled, the existing live
+verification helper checks pod attachments, host TCP access to storage
+endpoints, and a synthetic V2 volume write/read. It creates and normally removes
+a demo namespace and StorageClass; run it only on a disposable development
+cluster:
+
+```bash
+bash verify_longhorn_storage_network.sh
+```
+
 After setup, the Longhorn dashboard is available after exporting the port:
 
 ```bash
